@@ -1,0 +1,306 @@
+"""
+全局数据模型定义
+
+定义系统中所有核心数据结构，包括 Tick 行情、合约信息、交易信号、
+账户状态等 dataclass，供各模块统一引用。
+"""
+
+from __future__ import annotations
+
+import math
+from dataclasses import dataclass, field
+from datetime import date, datetime
+from enum import Enum
+from typing import Dict, List, Optional
+
+
+# ============================================================
+# 枚举类型
+# ============================================================
+
+class OptionType(Enum):
+    """期权类型"""
+    CALL = "call"
+    PUT = "put"
+
+
+class SignalType(Enum):
+    """套利信号方向"""
+    FORWARD = "forward"    # 正向：买现货 + 买Put + 卖Call
+    REVERSE = "reverse"    # 反向：卖现货 + 卖Put + 买Call
+
+
+class OrderSide(Enum):
+    """委托方向"""
+    BUY = "buy"
+    SELL = "sell"
+
+
+class AssetType(Enum):
+    """资产类别"""
+    OPTION = "option"
+    ETF = "etf"
+
+
+# ============================================================
+# Tick 行情数据
+# ============================================================
+
+@dataclass
+class TickData:
+    """
+    统一的 Tick 行情数据结构
+
+    兼容不同数据源的盘口深度差异：50ETF 含5档，300ETF/500ETF 仅1档。
+    缺失的档位以 NaN / 0 填充。
+    """
+    timestamp: datetime
+    contract_code: str          # 标准化代码（.SH 后缀）
+    current: float              # 最新价
+    volume: int                 # 累计成交量
+    high: float                 # 最高价
+    low: float                  # 最低价
+    money: float                # 累计成交额
+    position: int               # 持仓量
+    ask_prices: List[float] = field(default_factory=lambda: [math.nan] * 5)
+    ask_volumes: List[int] = field(default_factory=lambda: [0] * 5)
+    bid_prices: List[float] = field(default_factory=lambda: [math.nan] * 5)
+    bid_volumes: List[int] = field(default_factory=lambda: [0] * 5)
+
+    @property
+    def mid_price(self) -> float:
+        """买卖一档中间价"""
+        ask1 = self.ask_prices[0]
+        bid1 = self.bid_prices[0]
+        if math.isnan(ask1) or math.isnan(bid1):
+            return self.current
+        return (ask1 + bid1) / 2.0
+
+    @property
+    def spread(self) -> float:
+        """买卖一档价差"""
+        ask1 = self.ask_prices[0]
+        bid1 = self.bid_prices[0]
+        if math.isnan(ask1) or math.isnan(bid1):
+            return math.nan
+        return ask1 - bid1
+
+
+@dataclass
+class ETFTickData:
+    """
+    标的 ETF Tick 数据
+
+    可来自实际数据或模拟器生成，与期权 Tick 时间对齐。
+    """
+    timestamp: datetime
+    etf_code: str               # 如 510050.SH
+    price: float                # 最新价
+    volume: int = 0
+    ask_price: float = math.nan # 卖一价
+    bid_price: float = math.nan # 买一价
+    is_simulated: bool = False  # 标记是否为模拟数据
+
+
+# ============================================================
+# 合约基本信息
+# ============================================================
+
+# 标的简称 -> ETF 代码映射
+UNDERLYING_MAP: Dict[str, str] = {
+    "50ETF":    "510050.SH",
+    "300ETF":   "510300.SH",
+    "500ETF":   "510500.SH",
+    "科创50":   "588000.SH",
+    "科创板50": "588000.SH",
+}
+
+# 代码后缀映射（数据源适配）
+CODE_SUFFIX_MAP = {
+    ".XSHG": ".SH",
+    ".XSHE": ".SZ",
+}
+
+
+def normalize_code(code: str, target_suffix: str = ".SH") -> str:
+    """
+    将不同数据源的证券代码后缀标准化
+
+    Args:
+        code: 原始代码，如 '10000001.XSHG' 或 '10000001.SH'
+        target_suffix: 目标后缀，默认 '.SH'
+
+    Returns:
+        标准化后的代码，如 '10000001.SH'
+    """
+    for src, dst in CODE_SUFFIX_MAP.items():
+        if code.endswith(src):
+            if dst == target_suffix:
+                return code.replace(src, dst)
+            else:
+                return code
+    return code
+
+
+@dataclass
+class ContractInfo:
+    """
+    期权合约基本信息
+
+    数据来源：info_data/上交所期权基本信息.csv
+    缺失字段（如合约单位）使用市场默认值。
+    """
+    contract_code: str          # 标准化代码（.SH 后缀），如 10000001.SH
+    short_name: str             # 证券简称，如 "50ETF购2015年3月2200"
+    underlying_code: str        # 标的 ETF 代码，如 510050.SH
+    option_type: OptionType     # 认购 -> CALL，认沽 -> PUT
+    strike_price: float         # 行权价
+    list_date: date             # 起始交易日期
+    expiry_date: date           # 最后交易日期（到期日）
+    delivery_month: str         # 交割月份，如 "201503"
+    contract_unit: int = 10000  # 合约单位（ETF 期权统一为 10000）
+    exchange: str = "SH"        # 交易所
+
+    @property
+    def is_call(self) -> bool:
+        return self.option_type == OptionType.CALL
+
+    @property
+    def is_put(self) -> bool:
+        return self.option_type == OptionType.PUT
+
+    def time_to_expiry(self, current_date: date) -> float:
+        """计算距到期日的年化时间（以自然日 / 365 计）"""
+        delta = (self.expiry_date - current_date).days
+        return max(delta / 365.0, 0.0)
+
+
+# ============================================================
+# 交易信号
+# ============================================================
+
+@dataclass
+class TradeSignal:
+    """
+    PCP 套利交易信号
+
+    由策略模块产出，传递给回测引擎执行。
+    """
+    timestamp: datetime
+    signal_type: SignalType     # 正向 / 反向
+    call_code: str              # 认购合约代码
+    put_code: str               # 认沽合约代码
+    underlying_code: str        # 标的 ETF 代码
+    strike: float               # 行权价
+    expiry: date                # 到期日
+
+    # 触发时的市场价格快照
+    call_ask: float             # Call 卖一价（正向套利卖出 Call 的成交价参考）
+    call_bid: float             # Call 买一价
+    put_ask: float              # Put 卖一价
+    put_bid: float              # Put 买一价
+    spot_price: float           # 标的 ETF 价格
+
+    # 理论与实际价差
+    theoretical_spread: float   # 理论 PCP 价差
+    actual_spread: float        # 实际市场价差
+    net_profit_estimate: float  # 扣除费用后的预估净利润（每组合约）
+    confidence: float = 0.0     # 信号置信度 [0, 1]
+
+
+# ============================================================
+# 交易记录
+# ============================================================
+
+@dataclass
+class TradeRecord:
+    """
+    单笔成交记录
+
+    记录回测引擎中每一笔模拟成交的详细信息。
+    """
+    trade_id: int
+    timestamp: datetime
+    asset_type: AssetType       # 期权 / ETF
+    contract_code: str
+    side: OrderSide             # 买入 / 卖出
+    price: float                # 成交价
+    quantity: int               # 成交数量（期权为张数，ETF 为份数）
+    commission: float           # 手续费
+    slippage_cost: float        # 滑点成本
+    signal_id: Optional[int] = None  # 关联的信号 ID
+
+
+# ============================================================
+# 持仓与账户
+# ============================================================
+
+@dataclass
+class Position:
+    """
+    单品种持仓
+
+    跟踪特定合约的净持仓、成本和盈亏。
+    """
+    contract_code: str
+    asset_type: AssetType
+    quantity: int = 0           # 净持仓（正为多头，负为空头）
+    avg_cost: float = 0.0      # 持仓均价
+    realized_pnl: float = 0.0  # 已实现盈亏
+    margin_occupied: float = 0.0  # 占用保证金（仅期权卖方）
+
+    @property
+    def is_long(self) -> bool:
+        return self.quantity > 0
+
+    @property
+    def is_short(self) -> bool:
+        return self.quantity < 0
+
+
+@dataclass
+class AccountState:
+    """
+    账户状态快照
+
+    记录某一时刻的资金和持仓全貌。
+    """
+    timestamp: datetime
+    cash: float                             # 可用现金
+    total_margin: float                     # 总保证金占用
+    positions: Dict[str, Position] = field(default_factory=dict)
+    realized_pnl: float = 0.0              # 累计已实现盈亏
+    unrealized_pnl: float = 0.0            # 未实现盈亏
+    total_commission: float = 0.0          # 累计手续费
+
+    @property
+    def equity(self) -> float:
+        """账户权益 = 现金 + 未实现盈亏"""
+        return self.cash + self.unrealized_pnl
+
+    @property
+    def net_asset_value(self) -> float:
+        """净资产 = 权益 - 保证金占用（可用资金）"""
+        return self.equity - self.total_margin
+
+
+# ============================================================
+# Greeks 归因
+# ============================================================
+
+@dataclass
+class GreeksAttribution:
+    """
+    希腊字母盈亏归因
+
+    将组合 P&L 拆解为各 Greeks 贡献。
+    """
+    delta_pnl: float = 0.0
+    gamma_pnl: float = 0.0
+    theta_pnl: float = 0.0
+    vega_pnl: float = 0.0
+    residual: float = 0.0      # 残差（高阶项 + 模型误差）
+
+    @property
+    def total(self) -> float:
+        return self.delta_pnl + self.gamma_pnl + self.theta_pnl + self.vega_pnl + self.residual

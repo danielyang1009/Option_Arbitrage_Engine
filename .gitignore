@@ -1,0 +1,45 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg
+*.egg-info/
+dist/
+build/
+
+# 虚拟环境
+.venv/
+venv/
+env/
+
+# 大型数据文件（本地路径，不上传）
+tick_data/
+*.parquet
+*.feather
+
+# 日志和缓存
+*.log
+logs/
+.cache/
+
+# 回测输出图表（可选上传，按需取消注释）
+# output_*.png
+# *.png
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+
+# 环境变量（含密钥）
+.env
+.env.*
+secrets.py
+
+# Cursor
+.cursorignore
