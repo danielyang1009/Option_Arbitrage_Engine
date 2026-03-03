@@ -161,6 +161,51 @@ class ContractInfoManager:
                 expiries.add(info.expiry_date)
         return sorted(expiries)
 
+    def load_multipliers_from_wind(self, codes: Optional[List[str]] = None, batch_size: int = 200) -> int:
+        """
+        通过 Wind wss 批量查询真实合约乘数，更新 contract_unit 字段。
+
+        Args:
+            codes: 要查询的合约代码列表；None 表示查所有已加载的合约
+            batch_size: 单批查询上限
+
+        Returns:
+            成功更新的合约数
+        """
+        try:
+            from WindPy import w
+        except ImportError:
+            logger.warning("WindPy 不可用，跳过乘数查询，全部使用默认值 10000")
+            return 0
+
+        if codes is None:
+            codes = list(self.contracts.keys())
+        if not codes:
+            return 0
+
+        updated = 0
+        for i in range(0, len(codes), batch_size):
+            batch = codes[i : i + batch_size]
+            result = w.wss(",".join(batch), "contractmultiplier")
+            if result is None or result.ErrorCode != 0:
+                logger.warning("Wind wss 查询乘数失败 (batch %d)", i // batch_size)
+                continue
+            for j, code in enumerate(result.Codes):
+                norm = normalize_code(code, ".SH")
+                info = self.contracts.get(norm)
+                if info is None:
+                    continue
+                try:
+                    mult = int(float(result.Data[0][j]))
+                    if mult > 0:
+                        info.contract_unit = mult
+                        updated += 1
+                except (TypeError, ValueError, IndexError):
+                    pass
+
+        logger.info("已从 Wind 更新 %d / %d 个合约的真实乘数", updated, len(codes))
+        return updated
+
     def get_contracts_by_underlying(self, underlying: str) -> List[ContractInfo]:
         """
         获取指定标的的所有合约
@@ -183,11 +228,14 @@ class ContractInfoManager:
             return UNDERLYING_MAP[underlying]
         return normalize_code(underlying, ".SH")
 
+    _ADJUSTED_TAIL_RE = re.compile(r"[A-Z]$")
+
     def _parse_csv_row(self, row: Dict[str, str]) -> Optional[ContractInfo]:
         """
         解析 CSV 中的一行数据为 ContractInfo
 
         跳过空行（证券代码为空的行）。
+        自动识别调整型合约（ETF 分红后产生，名称末尾带 A/B/C 标记）。
         """
         raw_code = row.get("证券代码", "").strip()
         if not raw_code:
@@ -205,6 +253,8 @@ class ContractInfoManager:
         expiry_date = datetime.strptime(row["最后交易日期"], "%Y-%m-%d").date()
         delivery_month = row.get("交割月份", "").strip()
 
+        is_adjusted = bool(self._ADJUSTED_TAIL_RE.search(short_name))
+
         return ContractInfo(
             contract_code=contract_code,
             short_name=short_name,
@@ -214,6 +264,7 @@ class ContractInfoManager:
             list_date=list_date,
             expiry_date=expiry_date,
             delivery_month=delivery_month,
+            is_adjusted=is_adjusted,
         )
 
     @staticmethod

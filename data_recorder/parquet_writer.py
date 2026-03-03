@@ -1,0 +1,356 @@
+# -*- coding: utf-8 -*-
+"""
+Parquet 分片写入器
+
+写入策略（崩溃安全设计）：
+  - 内存缓冲区按品种分别保存，每 flush_interval_secs 秒写一个完整 Parquet 分片
+  - 每个分片完全关闭后才开始下一个，保证每个分片文件均可独立读取
+  - 崩溃最多丢失最近 flush_interval_secs 秒的数据
+  - 每次刷新同步更新 snapshot_latest.parquet（每个合约只保留最新一条）
+
+目录结构：
+    {output_dir}/
+    ├── chunks/
+    │   ├── options_20260303_093000.parquet   ← 期权分片（按时间命名）
+    │   ├── options_20260303_093030.parquet
+    │   ├── etf_20260303_093000.parquet       ← ETF 分片
+    │   └── ...
+    ├── snapshot_latest.parquet               ← 实时最新快照（供策略冷启动使用）
+    ├── options_20260303.parquet              ← 日终合并后的日文件
+    └── etf_20260303.parquet
+
+Parquet Schema：
+    options: ts(int64), code(str), underlying(str),
+             last(float32), ask1(float32), bid1(float32),
+             oi(int32), vol(int32), high(float32), low(float32),
+             is_adjusted(bool), multiplier(int32)
+    etf:     ts(int64), code(str),
+             last(float32), ask1(float32), bid1(float32)
+    snapshot: type(str), code(str), underlying(str),
+              ts(int64), last(float32), ask1(float32), bid1(float32),
+              oi(int32), vol(int32), high(float32), low(float32),
+              is_adjusted(bool), multiplier(int32)
+"""
+
+from __future__ import annotations
+
+import logging
+import math
+import threading
+from collections import defaultdict
+from datetime import date, datetime
+from pathlib import Path
+from typing import Any, Dict, List, Optional
+
+logger = logging.getLogger(__name__)
+
+# ──────────────────────────────────────────────────────────────────────
+# PyArrow Schema 定义（延迟导入，不强制依赖）
+# ──────────────────────────────────────────────────────────────────────
+
+def _get_option_schema():
+    import pyarrow as pa
+    return pa.schema([
+        pa.field("ts",          pa.int64()),
+        pa.field("code",        pa.string()),
+        pa.field("underlying",  pa.string()),
+        pa.field("last",        pa.float32()),
+        pa.field("ask1",        pa.float32()),
+        pa.field("bid1",        pa.float32()),
+        pa.field("oi",          pa.int32()),
+        pa.field("vol",         pa.int32()),
+        pa.field("high",        pa.float32()),
+        pa.field("low",         pa.float32()),
+        pa.field("is_adjusted", pa.bool_()),   # True = ETF 分红后调整型合约
+        pa.field("multiplier", pa.int32()),   # 真实合约乘数（标准 10000 / 调整型如 10265）
+    ])
+
+def _get_etf_schema():
+    import pyarrow as pa
+    return pa.schema([
+        pa.field("ts",   pa.int64()),
+        pa.field("code", pa.string()),
+        pa.field("last", pa.float32()),
+        pa.field("ask1", pa.float32()),
+        pa.field("bid1", pa.float32()),
+    ])
+
+def _get_snapshot_schema():
+    import pyarrow as pa
+    return pa.schema([
+        pa.field("type",        pa.string()),   # "option" or "etf"
+        pa.field("code",        pa.string()),
+        pa.field("underlying",  pa.string()),
+        pa.field("ts",          pa.int64()),
+        pa.field("last",        pa.float32()),
+        pa.field("ask1",        pa.float32()),
+        pa.field("bid1",        pa.float32()),
+        pa.field("oi",          pa.int32()),
+        pa.field("vol",         pa.int32()),
+        pa.field("high",        pa.float32()),
+        pa.field("low",         pa.float32()),
+        pa.field("is_adjusted", pa.bool_()),    # True = 调整型合约
+        pa.field("multiplier", pa.int32()),   # 合约乘数
+    ])
+
+
+# ──────────────────────────────────────────────────────────────────────
+# ParquetWriter
+# ──────────────────────────────────────────────────────────────────────
+
+class ParquetWriter:
+    """
+    带分片写入、崩溃安全保证和日终合并的 Parquet 写入器。
+
+    线程安全：buffer 和 snapshot 的访问由 _lock 保护，
+    供 Wind 回调线程（写入）和定时刷新线程（读取+清空）共同使用。
+    """
+
+    def __init__(self, output_dir: str, flush_interval_secs: int = 30) -> None:
+        self._root = Path(output_dir)
+        self._chunks_dir = self._root / "chunks"
+        self._flush_interval = flush_interval_secs
+
+        self._root.mkdir(parents=True, exist_ok=True)
+        self._chunks_dir.mkdir(parents=True, exist_ok=True)
+
+        # 内存缓冲区（列表存 dict，按类型分开）
+        self._opt_buffer:  List[Dict[str, Any]] = []
+        self._etf_buffer:  List[Dict[str, Any]] = []
+
+        # 最新快照字典：code → snapshot_row_dict
+        self._snapshot:    Dict[str, Dict[str, Any]] = {}
+
+        self._lock = threading.Lock()
+        self._last_flush_time = datetime.now()
+
+        logger.info("ParquetWriter 初始化：%s  刷新间隔 %ds", self._root, flush_interval_secs)
+
+    # ──────────────────────────────────────────────────────────
+    # 数据写入接口（由 Wind 回调线程调用）
+    # ──────────────────────────────────────────────────────────
+
+    def on_option_tick(self, tick_row: Dict[str, Any]) -> None:
+        """
+        缓冲一条期权 tick。
+
+        Args:
+            tick_row: 包含 ts/code/underlying/last/ask1/bid1/oi/vol/high/low 的字典
+        """
+        with self._lock:
+            self._opt_buffer.append(tick_row)
+            self._snapshot[tick_row["code"]] = {**tick_row, "type": "option"}
+
+    def on_etf_tick(self, tick_row: Dict[str, Any]) -> None:
+        """
+        缓冲一条 ETF tick。
+
+        Args:
+            tick_row: 包含 ts/code/last/ask1/bid1 的字典
+        """
+        with self._lock:
+            self._etf_buffer.append(tick_row)
+            self._snapshot[tick_row["code"]] = {
+                **tick_row,
+                "type":        "etf",
+                "underlying":  tick_row["code"],
+                "oi":          0,
+                "vol":         0,
+                "high":        tick_row.get("last", 0.0),
+                "low":         tick_row.get("last", 0.0),
+                "is_adjusted": False,
+                "multiplier":  0,
+            }
+
+    # ──────────────────────────────────────────────────────────
+    # 刷新（定时由主线程调用）
+    # ──────────────────────────────────────────────────────────
+
+    def should_flush(self) -> bool:
+        """是否到了刷新时间"""
+        elapsed = (datetime.now() - self._last_flush_time).total_seconds()
+        return elapsed >= self._flush_interval
+
+    def flush(self, dt: Optional[datetime] = None) -> int:
+        """
+        将内存缓冲区写入分片文件并更新 snapshot_latest.parquet。
+
+        Returns:
+            本次写入的总 tick 行数
+        """
+        if dt is None:
+            dt = datetime.now()
+
+        with self._lock:
+            opt_rows  = self._opt_buffer[:]
+            etf_rows  = self._etf_buffer[:]
+            snap_rows = list(self._snapshot.values())
+            self._opt_buffer.clear()
+            self._etf_buffer.clear()
+
+        total = 0
+        ts_str = dt.strftime("%Y%m%d_%H%M%S")
+        date_str = dt.strftime("%Y%m%d")
+
+        if opt_rows:
+            path = self._chunks_dir / f"options_{date_str}_{ts_str}.parquet"
+            _write_rows(opt_rows, path, _get_option_schema(), _option_row_to_arrays)
+            total += len(opt_rows)
+            logger.debug("写入期权分片 %s (%d 行)", path.name, len(opt_rows))
+
+        if etf_rows:
+            path = self._chunks_dir / f"etf_{date_str}_{ts_str}.parquet"
+            _write_rows(etf_rows, path, _get_etf_schema(), _etf_row_to_arrays)
+            total += len(etf_rows)
+            logger.debug("写入 ETF 分片 %s (%d 行)", path.name, len(etf_rows))
+
+        # 更新最新快照文件
+        if snap_rows:
+            snap_path = self._root / "snapshot_latest.parquet"
+            _write_rows(snap_rows, snap_path, _get_snapshot_schema(), _snapshot_row_to_arrays)
+
+        self._last_flush_time = dt
+
+        if total:
+            logger.info("[%s] 刷新完成：%d 条 tick 已写入磁盘", dt.strftime("%H:%M:%S"), total)
+        return total
+
+    # ──────────────────────────────────────────────────────────
+    # 日终合并（主线程调用，在 15:10 或程序退出时执行）
+    # ──────────────────────────────────────────────────────────
+
+    def merge_daily(self, target_date: Optional[date] = None) -> None:
+        """
+        合并当日所有分片为两个日文件：options_YYYYMMDD.parquet 和 etf_YYYYMMDD.parquet。
+        合并成功后删除分片文件。
+        """
+        if target_date is None:
+            target_date = date.today()
+        date_str = target_date.strftime("%Y%m%d")
+
+        for prefix, schema, row_func in [
+            ("options", _get_option_schema(), _option_row_to_arrays),
+            ("etf",     _get_etf_schema(),    _etf_row_to_arrays),
+        ]:
+            chunks = sorted(self._chunks_dir.glob(f"{prefix}_{date_str}_*.parquet"))
+            if not chunks:
+                continue
+
+            try:
+                import pyarrow.parquet as pq
+                tables = [pq.read_table(str(c)) for c in chunks]
+                import pyarrow as pa
+                merged = pa.concat_tables(tables)
+                # 按时间戳排序
+                import pyarrow.compute as pc
+                idx = pc.sort_indices(merged, sort_keys=[("ts", "ascending")])
+                merged = merged.take(idx)
+
+                out_path = self._root / f"{prefix}_{date_str}.parquet"
+                pq.write_table(merged, str(out_path), compression="snappy")
+                logger.info("日终合并完成：%s (%d 行，%d 个分片)",
+                            out_path.name, len(merged), len(chunks))
+
+                # 删除分片
+                for c in chunks:
+                    c.unlink(missing_ok=True)
+            except Exception as e:
+                logger.error("日终合并失败 [%s]: %s", prefix, e)
+
+    # ──────────────────────────────────────────────────────────
+    # 快照读取（供策略模块冷启动恢复状态）
+    # ──────────────────────────────────────────────────────────
+
+    def load_snapshot(self) -> Optional[object]:
+        """
+        读取 snapshot_latest.parquet，返回 pandas DataFrame 或 None。
+
+        DataFrame 列：type, code, underlying, ts, last, ask1, bid1, oi, vol, high, low
+        """
+        snap_path = self._root / "snapshot_latest.parquet"
+        if not snap_path.exists():
+            return None
+        try:
+            import pandas as pd
+            return pd.read_parquet(str(snap_path))
+        except Exception as e:
+            logger.warning("快照读取失败: %s", e)
+            return None
+
+    @property
+    def snapshot_path(self) -> Path:
+        return self._root / "snapshot_latest.parquet"
+
+    @property
+    def opt_buffer_len(self) -> int:
+        with self._lock:
+            return len(self._opt_buffer)
+
+    @property
+    def etf_buffer_len(self) -> int:
+        with self._lock:
+            return len(self._etf_buffer)
+
+
+# ──────────────────────────────────────────────────────────────────────
+# 内部工具函数
+# ──────────────────────────────────────────────────────────────────────
+
+def _nan_to_none(v: Any) -> Any:
+    if isinstance(v, float) and math.isnan(v):
+        return None
+    return v
+
+
+def _write_rows(rows: List[Dict], path: Path, schema, row_to_arrays_fn) -> None:
+    """将 dict 列表写入一个完整的 Parquet 文件"""
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+    arrays = row_to_arrays_fn(rows)
+    table = pa.table(arrays, schema=schema)
+    pq.write_table(table, str(path), compression="snappy")
+
+
+def _option_row_to_arrays(rows: List[Dict]) -> Dict[str, list]:
+    return {
+        "ts":          [r["ts"]         for r in rows],
+        "code":        [r["code"]       for r in rows],
+        "underlying":  [r["underlying"] for r in rows],
+        "last":        [_nan_to_none(r.get("last"))  for r in rows],
+        "ask1":        [_nan_to_none(r.get("ask1"))  for r in rows],
+        "bid1":        [_nan_to_none(r.get("bid1"))  for r in rows],
+        "oi":          [r.get("oi",  0) for r in rows],
+        "vol":         [r.get("vol", 0) for r in rows],
+        "high":        [_nan_to_none(r.get("high")) for r in rows],
+        "low":         [_nan_to_none(r.get("low"))  for r in rows],
+        "is_adjusted": [r.get("is_adjusted", False) for r in rows],
+        "multiplier":  [r.get("multiplier", 10000)  for r in rows],
+    }
+
+
+def _etf_row_to_arrays(rows: List[Dict]) -> Dict[str, list]:
+    return {
+        "ts":   [r["ts"]   for r in rows],
+        "code": [r["code"] for r in rows],
+        "last": [_nan_to_none(r.get("last")) for r in rows],
+        "ask1": [_nan_to_none(r.get("ask1")) for r in rows],
+        "bid1": [_nan_to_none(r.get("bid1")) for r in rows],
+    }
+
+
+def _snapshot_row_to_arrays(rows: List[Dict]) -> Dict[str, list]:
+    return {
+        "type":        [r.get("type",       "option") for r in rows],
+        "code":        [r["code"]                      for r in rows],
+        "underlying":  [r.get("underlying", r["code"]) for r in rows],
+        "ts":          [r["ts"]                        for r in rows],
+        "last":        [_nan_to_none(r.get("last"))    for r in rows],
+        "ask1":        [_nan_to_none(r.get("ask1"))    for r in rows],
+        "bid1":        [_nan_to_none(r.get("bid1"))    for r in rows],
+        "oi":          [r.get("oi",  0)                for r in rows],
+        "vol":         [r.get("vol", 0)                for r in rows],
+        "high":        [_nan_to_none(r.get("high"))    for r in rows],
+        "low":         [_nan_to_none(r.get("low"))     for r in rows],
+        "is_adjusted": [r.get("is_adjusted", False)    for r in rows],
+        "multiplier":  [r.get("multiplier", 0)         for r in rows],
+    }

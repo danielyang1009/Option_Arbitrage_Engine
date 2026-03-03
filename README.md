@@ -1,7 +1,8 @@
-# 中国 ETF 期权 PCP 套利框架
+# 中国 ETF 期权 PCP 套利引擎
 
-> **Put-Call Parity Arbitrage Engine for Chinese ETF Options**  
-> 实盘信号监控 + Tick 级历史回测 | Python 3.10+ | Wind API
+> **Put-Call Parity Arbitrage Engine for Chinese ETF Options**
+> 实时数据采集 · 严格 Bid/Ask 套利计算 · 动态合约乘数 · 终端/网页双监控 · Tick 级回测
+> Python 3.10+ | Wind API | Flask | ZeroMQ | Parquet
 
 ---
 
@@ -10,35 +11,40 @@
 - [项目概述](#一项目概述)
 - [目录结构](#二目录结构)
 - [核心模块说明](#三核心模块说明)
-- [模块交互流程](#四模块交互流程)
-- [套利计算方法](#五套利计算方法)
-- [快速开始](#六快速开始)
-- [实盘监控使用指南](#七实盘监控使用指南)
-- [回测使用指南](#八回测使用指南)
-- [配置说明](#九配置说明)
-- [数据说明](#十数据说明)
-- [已知限制](#十一已知限制)
+- [套利计算方法（v2 严格公式）](#四套利计算方法)
+- [调整型合约处理](#五调整型合约处理)
+- [模块交互流程](#六模块交互流程)
+- [快速开始](#七快速开始)
+- [数据记录进程](#八数据记录进程)
+- [终端监控 term_monitor](#九终端监控)
+- [网页监控 web_monitor](#十网页监控)
+- [回测](#十一回测)
+- [配置说明](#十二配置说明)
+- [数据说明](#十三数据说明)
+- [已知限制](#十四已知限制)
 
 ---
 
 ## 一、项目概述
 
-本框架专为**中国上交所 ETF 期权**的 Put-Call Parity（认沽认购平价）套利设计，提供两个核心功能：
+本引擎专为**上交所 ETF 期权**的 Put-Call Parity 套利设计，覆盖从数据采集到信号生成的完整链路。
 
-| 功能 | 工具 | 描述 |
+| 功能 | 入口 | 说明 |
 |------|------|------|
-| **实盘监控** | `monitor_live.py` / `monitor_live.ipynb` | 连接 Wind API，实时扫描套利机会，富文本表格输出，供人工下单参考 |
-| **历史回测** | `main.py --mode backtest` | 加载本地历史 Tick 数据，Tick 级精确回测，输出 P&L、Sharpe、权益曲线 |
+| **实时数据采集** | `data_recorder/recorder.py` | Wind Push 回调，全品种全到期月，Parquet 分片 + ZMQ 广播 |
+| **终端套利监控** | `term_monitor.py` | rich 彩色表格，直连 Wind 或读 ZMQ，分区显示正常/调整型合约 |
+| **网页套利监控** | `web_monitor.py` | Flask 暗色主题仪表盘，自动刷新，三品种分区 |
+| **历史回测** | `main.py --mode backtest` | 本地 Tick 级精确回测，P&L / Sharpe / 权益曲线 |
 
-**支持品种**（上交所）：
+**监控品种**：
 
-| 品种 | ETF 代码 | 期权代码前缀 |
-|------|----------|------------|
-| 50ETF 期权 | 510050.SH | 10XXXX |
-| 300ETF 期权（华泰） | 510300.SH | 10XXXX |
-| 500ETF 期权（南方） | 510500.SH | 10XXXX |
-| 科创 50 期权 | 588000.SH | 10XXXX |
-| 科创板 50 期权 | 588050.SH | 10XXXX |
+| 品种 | ETF 代码 | 说明 |
+|------|----------|------|
+| 50ETF 期权 | 510050.SH | 华夏上证 50ETF |
+| 300ETF 期权 | 510300.SH | 华泰柏瑞沪深 300ETF |
+| 500ETF 期权 | 510500.SH | 南方中证 500ETF |
+
+> 科创 50（588000.SH / 588050.SH）不纳入监控和记录。
 
 ---
 
@@ -47,46 +53,49 @@
 ```
 d:\Option_Arbitrage_Engine\
 │
-├── monitor_live.py          ★ 实盘监控主程序（终端彩色表格，Rich）
-├── monitor_live.ipynb       ★ 实盘监控 Jupyter 版（HTML 刷新）
-├── main.py                    历史回测入口（也含旧版监控骨架）
-├── models.py                  全局数据模型定义
+├── term_monitor.py          ★ 终端套利监控（rich 表格，--source wind / --source zmq）
+├── web_monitor.py           ★ 网页套利监控（Flask，localhost:8080）
+├── main.py                    历史回测入口
+├── models.py                  全局数据模型（TickData / ContractInfo / TradeSignal 等）
 ├── requirements.txt           依赖列表
-├── STATE.md                   项目状态交接文档
 ├── README.md                  本文件
+├── STATE.md                   项目状态文档（AI 上下文恢复用）
 │
 ├── config/
-│   └── settings.py            全局配置（费率/滑点/保证金/阈值）
+│   └── settings.py            全局配置（TradingConfig + RecorderConfig）
+│
+├── data_recorder/             ★ 实时数据记录进程
+│   ├── recorder.py              主进程：队列消费 + 定时刷新 + 日终合并
+│   ├── wind_subscriber.py       Wind wsq Push 回调（分批订阅，含乘数查询）
+│   ├── parquet_writer.py        分片写入（30s，崩溃安全）+ 快照 + 日终合并
+│   └── zmq_publisher.py         ZeroMQ PUB 广播
 │
 ├── data_engine/
-│   ├── tick_loader.py         CSV Tick 加载器（向量化，支持日期过滤）
-│   ├── contract_info.py       合约信息管理（.SH/.XSHG 标准化，Call/Put 配对）
-│   ├── wind_adapter.py        Wind API 适配器（wsq 订阅，无 Wind 时 Mock 降级）
-│   └── etf_simulator.py       ETF 价格模拟器（回测用，GBM + PCP 隐含锚点）
+│   ├── tick_loader.py           CSV Tick 加载器（向量化）
+│   ├── contract_info.py         合约信息管理（CSV 加载 + Wind 乘数查询）
+│   ├── wind_adapter.py          Wind API 适配器
+│   └── etf_simulator.py         ETF 价格模拟器（回测用）
 │
 ├── core/
-│   └── pricing.py             Black-Scholes 定价 + Newton-Raphson 隐含波动率求解
+│   └── pricing.py               Black-Scholes 定价 + IV 求解
 │
 ├── strategies/
-│   └── pcp_arbitrage.py       PCP 套利策略 + TickAligner 多合约时间对齐器
+│   └── pcp_arbitrage.py         PCP 套利策略（严格 Bid/Ask 公式 + 动态乘数）
 │
 ├── risk/
-│   └── margin.py              上交所卖方保证金计算（认购/认沽公式）
+│   └── margin.py                上交所卖方保证金计算
 │
 ├── backtest/
-│   └── engine.py              Tick-by-Tick 回测引擎 + Account 账户管理
+│   └── engine.py                Tick-by-Tick 回测引擎
 │
 ├── analysis/
-│   └── pnl.py                 P&L 分析：回撤/Sharpe/胜率/Greeks 归因/权益曲线图
+│   └── pnl.py                   P&L 分析 + 权益曲线
 │
 ├── info_data/
-│   ├── 上交所期权基本信息.csv  11,102 条合约记录（行权价/类型/到期日）
-│   └── etf_option_info.md     品种上市时间参考
+│   ├── 上交所期权基本信息.csv    11,102 条合约记录
+│   └── etf_option_info.md        品种上市时间参考
 │
-└── sample_data/               小样本数据（快速功能验证）
-    ├── 华夏上证50ETF期权/
-    ├── 华泰柏瑞沪深300ETF期权/
-    └── 南方中证500ETF期权/
+└── sample_data/                  小样本数据（功能验证）
 ```
 
 ---
@@ -95,345 +104,338 @@ d:\Option_Arbitrage_Engine\
 
 ### 3.1 `models.py` — 全局数据模型
 
-所有模块共享的数据结构，无外部依赖。
+| 类 | 关键字段 |
+|----|---------|
+| `TickData` | contract_code, current, bid_prices[5], ask_prices[5], volume, position |
+| `ETFTickData` | etf_code, price, bid_price, ask_price |
+| `ContractInfo` | contract_code, strike_price, expiry_date, option_type, **contract_unit**, **is_adjusted** |
+| `TradeSignal` | signal_type, net_profit_estimate, **multiplier**, **is_adjusted**, **calc_detail** |
 
-| 类 | 说明 |
-|----|------|
-| `TickData` | 期权 Tick 快照：最新价、买卖1～5档价格与数量、时间戳 |
-| `ETFTickData` | ETF Tick 快照：etf_code、最新价、买一/卖一 |
-| `ContractInfo` | 合约静态信息：代码、行权价、到期日、类型、标的代码 |
-| `TradeSignal` | 套利信号：方向（正向/反向）、Call/Put 代码、净利润估算、置信度 |
-| `normalize_code()` | `.XSHG` ↔ `.SH` 代码标准化工具函数 |
+### 3.2 `config/settings.py` — 配置体系
 
-### 3.2 `config/settings.py` — 全局配置
-
-```python
+```
 TradingConfig
-├── FeeConfig        # 期权手续费 1.7元/张、ETF 佣金万0.6
-├── SlippageConfig   # 期权滑点 1 跳(0.0001)、ETF 滑点 1 跳(0.001)
-├── MarginConfig     # 认购/认沽保证金比例 12%/7%（上交所标准）
-└── 信号过滤         # min_profit_threshold = 50元/组（默认）
+├── FeeConfig              期权 1.7元/张、ETF 佣金万0.6
+├── SlippageConfig         期权 1跳(0.0001)、ETF 1跳(0.001)
+├── MarginConfig           认购/认沽保证金 12%/7%
+├── etf_fee_rate           ETF 现货单边规费 万2（默认 0.0002）
+├── option_round_trip_fee  期权双边固定手续费 3.0 元/张
+├── enable_reverse         反向套利开关（默认 False，未计融券利息）
+├── min_profit_threshold   最小净利润阈值 50 元
+└── contract_unit          默认合约单位 10000（实际由 Wind 动态查询覆盖）
+
+RecorderConfig
+├── products               ['510050.SH', '510300.SH', '510500.SH']
+├── output_dir             D:\MARKET_DATA
+├── zmq_port               5555
+├── flush_interval_secs    30
+└── batch_size             80
 ```
 
-### 3.3 `data_engine/contract_info.py` — 合约信息管理
+### 3.3 `strategies/pcp_arbitrage.py` — 核心策略引擎
 
-- 从 CSV 加载 11,102 条合约记录，自动处理 UTF-8-BOM 编码
-- `find_call_put_pairs(underlying, expiry)` — 匹配同行权价的 Call/Put 对
-- `get_active_contracts(days)` — 过滤 N 天内到期的活跃合约
-- 自动处理 `.SH` / `.XSHG` 代码互转
+**TickAligner**：多品种报价快照管理器，按 etf_code 分别存储，支持 Bid/Ask 价独立获取。
 
-### 3.4 `data_engine/tick_loader.py` — 历史 Tick 加载器
+**PCPArbitrage**：
+- 严格区分买卖盘口，**不使用最新价或中间价**
+- 动态读取 `call_info.contract_unit` 作为真实乘数
+- `enable_reverse=False` 时自动过滤反向信号
+- 每个信号输出 `calc_detail` 人可读公式字符串
 
-- 向量化 pandas 解析，10万条约 1.3 秒
-- 时间戳解析：支持 17 位整型（`YYYYMMDDHHMMSSmmm`）和科学计数法格式
-- 按文件名自动过滤日期范围（`--start-date` / `--end-date`）
-- 自动识别 1 档 / 5 档盘口格式
+### 3.4 `data_engine/contract_info.py` — 合约信息管理
 
-### 3.5 `data_engine/wind_adapter.py` — Wind API 适配器
+- 从 CSV 加载 11,102 条合约，自动检测调整型合约（名称以 A/B 等大写字母结尾）
+- `load_multipliers_from_wind(codes)` 通过 Wind `wss("contractmultiplier")` 批量查询真实乘数
+- 标准合约 = 10000，调整型如 50ETF 当前 = 10265
 
-- 封装 `WindPy.wsq` 实时行情订阅
-- 无 Wind 终端时自动降级为 Mock 模式（不抛异常）
-- 注意：需要 WindPy x64 版本（`C:\Wind\Wind.NET.Client\WindNET\x64`）
+### 3.5 `data_recorder/` — 数据记录系统
 
-### 3.6 `strategies/pcp_arbitrage.py` — 核心策略
-
-包含两个类：
-
-**`TickAligner`**：多合约报价快照管理器
-- 维护每个期权合约的最新 Tick（Last-Known-Value 机制）
-- 按 `etf_code` 分品种存储 ETF 行情，避免多品种互相覆盖
-
-**`PCPArbitrage`**：PCP 套利信号生成器
-- `on_option_tick()` / `on_etf_tick()`：接收行情更新
-- `scan_opportunities(pairs)`：遍历所有 Call/Put 对，计算 PCP 偏离，返回信号列表
-- `_estimate_costs()`：估算每组交易成本（手续费 + 佣金 + 滑点）
-
-### 3.7 `core/pricing.py` — 期权定价
-
-- Black-Scholes 公式（欧式期权，适用于 ETF 期权）
-- Newton-Raphson 隐含波动率（IV）求解
-- 用于回测中的 Greeks 计算（Delta/Gamma/Theta/Vega）
-
-### 3.8 `backtest/engine.py` — 回测引擎
-
-- `MergedTick`：将期权 Tick 流与 ETF Tick 流合并为统一时间线
-- `Account`：账户管理，持仓记录，保证金检查，T+1 约束
-- 撮合逻辑：使用 bid/ask 价格而非 last 价，更真实反映成交成本
-- 返回 `trade_history`、`signals`、`equity_curve` 字典
-
-### 3.9 `risk/margin.py` — 保证金计算
-
-上交所卖方保证金公式：
-```
-卖出认购 = 权利金 + max(12% × 标的价格 - 虚值额, 7% × 标的价格)
-卖出认沽 = 权利金 + max(12% × 标的价格 - 虚值额, 7% × 行权价格)
-```
-
-### 3.10 `analysis/pnl.py` — 绩效分析
-
-- 总收益、年化收益、最大回撤、Sharpe 比率、胜率
-- Greeks 归因（Delta/Gamma/Theta/Vega PnL 拆分，当前为骨架实现）
-- `plot_equity_curve()` — matplotlib 权益曲线图
-
-### 3.11 `monitor_live.py` — 实盘监控主程序
-
-- Windows 终端 UTF-8 编码修复（`ctypes.SetConsoleOutputCP(65001)`）
-- 使用 `rich.Live` 实现动态刷新彩色表格
-- Wind API 订阅：每次轮询 `cancelRequest(0)` 清除旧订阅再重新请求
-- ATM 过滤：`--atm-range` 参数控制行权价偏离范围，过滤深度虚值
-- 分批请求：单次 wsq ≤600 数据点限制（194合约 × 3字段 = 582点）
+| 模块 | 职责 |
+|------|------|
+| `wind_subscriber.py` | wsq Push 回调，分批订阅，记录 is_adjusted + multiplier |
+| `parquet_writer.py` | 30s 分片写入，崩溃安全，快照更新，日终合并 |
+| `zmq_publisher.py` | ZMQ PUB 广播，主题格式 `OPT_510050` / `ETF_510050` |
+| `recorder.py` | 主进程编排：队列消费 → 写 Parquet + ZMQ 广播 → 定时刷新 → 日终合并 |
 
 ---
 
-## 四、模块交互流程
+## 四、套利计算方法
 
-### 实盘监控流程
+### v2 严格 Bid/Ask 公式（当前版本）
 
-```
-monitor_live.py
-    │
-    ├── ContractInfoManager.load_from_csv()
-    │       └── info_data/上交所期权基本信息.csv
-    │
-    ├── WindPy.wsq(etf_codes + option_codes, "rt_last,rt_ask1,rt_bid1")
-    │       └── 每 N 秒轮询一次快照（cancelRequest → wsq → 解析）
-    │
-    ├── ETFTickData / TickData → TickAligner.update_etf() / update_option()
-    │
-    ├── PCPArbitrage.scan_opportunities(call_put_pairs)
-    │       ├── _evaluate_pair() × N 对
-    │       │       ├── 计算 theoretical_spread = S - K·e^{-rT}
-    │       │       ├── 计算 forward_profit（正向套利）
-    │       │       ├── 计算 reverse_profit（反向套利，A股通常不可执行）
-    │       │       └── _estimate_costs()（手续费 + 滑点）
-    │       └── 按利润降序排列信号
-    │
-    └── rich.Live → build_display(signals) → 终端彩色表格刷新
-```
+所有计算严格使用**吃单价格**（taker price），不使用最新价或中间价。
 
-### 历史回测流程
+#### 正向套利（Forward / Conversion）
+
+> 动作：以 S_ask 买入现货 + 以 P_ask 买入认沽 + 以 C_bid 卖出认购
 
 ```
-main.py --mode backtest
-    │
-    ├── ContractInfoManager.load_from_csv()
-    ├── TickLoader.load_directory()           ← 本地 CSV Tick 数据
-    ├── ETFSimulator.simulate_from_option_ticks()  ← GBM 模拟 ETF（回测专用）
-    │
-    ├── BacktestEngine.run()
-    │       ├── 合并期权 + ETF Tick 为统一时间线
-    │       ├── 逐 Tick 调用 strategy_callback()
-    │       │       └── PCPArbitrage.scan_opportunities()
-    │       ├── 信号触发 → Account 开仓 / 平仓
-    │       └── 记录 trade_history + equity_curve
-    │
-    └── PnLAnalyzer.analyze() → print_report() + plot_equity_curve()
+理论单股利润 = K - (S_ask + P_ask - C_bid)
+ETF 现货规费 = S_ask × multiplier × 0.0002
+真实单张净利 = 理论单股利润 × multiplier - ETF规费 - 3.0元
+```
+
+计算明细输出示例：`K(3.1)-S_a(3.0920)-P_a(0.0300)+C_b(0.1200)=-0.0020/股`
+
+#### 反向套利（Reverse / Reversal）
+
+> 动作：以 S_bid 融券卖现货 + 以 P_bid 卖出认沽 + 以 C_ask 买入认购
+
+```
+理论单股利润 = (S_bid + P_bid - C_ask) - K
+ETF 现货规费 = S_bid × multiplier × 0.0002
+真实单张净利 = 理论单股利润 × multiplier - ETF规费 - 3.0元
+```
+
+> **默认 `enable_reverse=False`**，反向套利未计融券利息成本，信号默认不输出。
+
+#### 成本参数
+
+| 参数 | 默认值 | 说明 |
+|------|--------|------|
+| `etf_fee_rate` | 0.0002 | ETF 单边规费（含佣金+过户费，约万2） |
+| `option_round_trip_fee` | 3.0 元 | 期权双边手续费（卖 Call 约 1.7 + 买 Put 约 1.3） |
+
+#### 操作建议
+
+| 净利润（元/张） | 建议 |
+|----------------|------|
+| < 100 | 腿差风险高，谨慎 |
+| 100 ~ 200 | 可考虑，确认盘口价差不过宽 |
+| > 200 | 信号较强，优先操作 |
+
+> 现货对冲数量 = 该合约的 **multiplier**（标准 10000 股，调整型可能是 10265 股等）。
+
+---
+
+## 五、调整型合约处理
+
+ETF 分红后，交易所会对存续期权合约进行调整，产生**调整型合约**：
+- 名称以 A、B 等大写字母结尾（如 `50ETF购3月2630A`）
+- 行权价非标准（如 2.630 而非 2.600）
+- 合约乘数 ≠ 10000（如 10265）
+
+### 引擎处理方式
+
+| 层级 | 处理 |
+|------|------|
+| **数据记录器** | 全部记录，Parquet 中包含 `is_adjusted` + `multiplier` 字段 |
+| **合约加载** | `ContractInfo.is_adjusted=True`，`contract_unit` 从 Wind 查询真实值 |
+| **套利计算** | 使用真实 multiplier 计算利润，`TradeSignal.is_adjusted` 标记 |
+| **监控显示** | 正常合约在前（按行权价升序）→ 分隔线 → 调整型在后（`(A)` 标记，乘数橙色高亮） |
+
+---
+
+## 六、模块交互流程
+
+### 推荐架构：data_recorder + term_monitor / web_monitor
+
+```
+Wind Terminal
+    │  wsq Push 回调（~3秒/次）
+    ▼
+data_recorder/recorder.py          ← 永续进程，交易时间全程运行
+    ├── tick_queue（线程安全）
+    ├── ParquetWriter
+    │    ├── chunks/options_YYYYMMDD_HHMMSS.parquet（每30秒）
+    │    ├── snapshot_latest.parquet（含 is_adjusted + multiplier）
+    │    └── options_YYYYMMDD.parquet（15:10 日终合并）
+    └── ZMQPublisher → tcp://127.0.0.1:5555
+
+term_monitor.py --source zmq       ← 可随时重启
+    ├── 启动：读 snapshot → 恢复 TickAligner + Wind 查乘数
+    ├── 运行：ZMQ SUB → 更新 TickAligner
+    └── 每N秒：scan_opportunities → rich 表格（正常合约 + 分隔线 + 调整型）
+
+web_monitor.py                      ← 可随时重启
+    ├── 后台线程：ZMQ SUB → TickAligner → scan → 共享 state
+    └── Flask：/api/signals → JS 前端轮询渲染
+```
+
+### 独立模式：直连 Wind
+
+```
+term_monitor.py --source wind       ← 不依赖 recorder
+    ├── Wind 连接 + 查乘数 + wsq 推送
+    ├── TickAligner.update_option/etf
+    └── 每N秒：scan_opportunities → rich 表格
 ```
 
 ---
 
-## 五、套利计算方法
-
-### Put-Call Parity 公式
-
-```
-理论：C - P = S - K·e^{-rT}
-
-正向套利（Conversion）—— 仅此方向在A股可执行：
-  条件：C_bid - P_ask > S_ask - K·e^{-rT} + 成本
-  操作：卖出 Call + 买入 Put + 买入 ETF
-  利润：(C_bid - P_ask - (S_ask - K·e^{-rT}) - 成本) × 10000
-
-反向套利（Reversal）—— A股现货T+1限制，通常无法执行：
-  条件：P_bid - C_ask > K·e^{-rT} - S_bid + 成本
-  操作：买入 Call + 卖出 Put + 卖出 ETF（受限）
-```
-
-### 成本构成（每组，合约单位 10000 份）
-
-| 成本项 | 计算方式 | 约合（3元ETF）|
-|--------|---------|--------------|
-| 期权手续费 | 1.7元/张 × 2张 | 3.4 元 |
-| ETF 佣金 | 标的价×10000×万0.6 | ~18 元 |
-| 期权滑点 | 1跳×0.0001×2腿×10000 | 2 元 |
-| ETF 滑点 | 1跳×0.001×10000 | 10 元 |
-| **合计** | | **≈ 33 元/组** |
-
-### 净利润字段含义
-
-`net_profit_estimate`（单位：元/组）= PCP 偏差收益 × 10000 - 上述成本
-
-**操作建议阈值**：
-
-| 净利润显示值 | 操作建议 |
-|-------------|---------|
-| < 100 元 | 滑点风险高，谨慎 |
-| 100 ~ 200 元 | 可考虑，需确认盘口价差不过宽 |
-| > 200 元 | 信号较强，优先操作 |
-
----
-
-## 六、快速开始
+## 七、快速开始
 
 ### 安装依赖
 
 ```bash
-# 标准依赖（回测 + 分析）
 pip install -r requirements.txt
-
-# 实盘监控额外依赖
-pip install rich>=13.0
-
-# WindPy（需要 Wind 金融终端）
-# 见下方 WindPy 安装说明
 ```
 
-### WindPy 安装（x64 Python 环境）
+核心依赖：`pandas` / `numpy` / `rich` / `pyzmq` / `pyarrow` / `flask`
+
+### WindPy 配置（x64 Python 环境）
 
 ```
 1. 确认 Wind 终端已安装并登录
-2. 找到 x64 版 WindPy：C:\Wind\Wind.NET.Client\WindNET\x64\
-3. 在 Python 的 site-packages 目录创建 WindPy.pth，内容：
-   C:\Wind\Wind.NET.Client\WindNET\x64
-4. 将 x64 目录下的 WindPy.py 复制到 site-packages
-5. 测试：python -c "from WindPy import w; print('OK')"
+2. x64 版 WindPy 路径：C:\Wind\Wind.NET.Client\WindNET\x64\
+3. site-packages 中创建 WindPy.pth 指向该路径
+4. 测试：python -c "from WindPy import w; print('OK')"
 ```
 
 ---
 
-## 七、实盘监控使用指南
+## 八、数据记录进程
+
+> 交易时间全程运行，**不要关闭**。监控进程从此获取实时数据。
 
 ```bash
-# 默认参数启动（显示净利润 ≥30 元的机会，90天内到期，每5秒刷新）
-python monitor_live.py
-
-# 推荐生产参数（过滤噪音）
-python monitor_live.py --min-profit 150 --expiry-days 45
-
-# 参数说明
-python monitor_live.py --min-profit 100   # 最小净利润阈值（元/组）
-python monitor_live.py --expiry-days 30   # 只看30天内到期合约
-python monitor_live.py --refresh 3        # 每3秒刷新
-python monitor_live.py --atm-range 0.10  # 只看 ±10% 行权价（过滤深度虚值）
-
-# Jupyter 版（适合记录历史信号）
-# 打开 monitor_live.ipynb → Run All → 按 ■ 停止
+python data_recorder/recorder.py                          # 默认参数
+python data_recorder/recorder.py --output D:\MARKET_DATA  # 自定义目录
+python data_recorder/recorder.py --flush 60               # 60秒分片
+python data_recorder/recorder.py --port 5556              # 自定义 ZMQ 端口
 ```
 
-### 输出表格列说明
+### Parquet Schema
 
-| 列名 | 含义 | 操作参考 |
-|------|------|---------|
-| 方向 | 正向 / 反向 | **只操作"正向"** |
-| 品种 | ETF 名称 | 50ETF / 300ETF / 500ETF / 科创50 |
-| 行权价 | Strike | — |
-| 到期 | 到期日 | 临近到期流动性可能变差 |
-| Call卖/Put买 | 实时盘口价 | 下单参考价 |
-| ETF买入 | 实时 Ask | 下单参考价 |
-| **PCP偏差** | 实际价差 - 理论价差 | 正数 = Call 被高估 |
-| **净利润(元)** | 扣除手续费和滑点后 | **核心决策指标** |
-| 置信度 | 0~1 综合评分 | ≥0.5 信号更可靠（注：挂单量数据受权限限制，仅供参考） |
+**期权**：`ts(int64), code(str), underlying(str), last/ask1/bid1(float32), oi/vol(int32), high/low(float32), is_adjusted(bool), multiplier(int32)`
 
-### 正向套利三腿下单顺序建议
+**ETF**：`ts(int64), code(str), last/ask1/bid1(float32)`
+
+**快照**：期权 schema + `type(str)`，ETF 行补充 `is_adjusted=False, multiplier=0`
+
+### 存储目录结构
 
 ```
-① 先挂 Call 腿卖出（流动性最差，先挂）
-② 再挂 Put 腿买入
-③ 最后市价买入 ETF（流动性最好）
-注意：三腿无法原子执行，存在腿差风险
+D:\MARKET_DATA\
+├── chunks\                            日内分片（15:10 合并后删除）
+├── snapshot_latest.parquet            每合约最新一条（策略冷启动用）
+├── options_YYYYMMDD.parquet           期权日文件（~60-90 MB/天）
+└── etf_YYYYMMDD.parquet               ETF 日文件（< 1 MB/天）
 ```
 
 ---
 
-## 八、回测使用指南
+## 九、终端监控
 
 ```bash
-# 单月回测（推荐入门）
+# 直连 Wind 模式（独立运行，推荐日常使用）
+python term_monitor.py --min-profit 50
+
+# ZMQ 模式（需先启动 recorder）
+python term_monitor.py --source zmq --min-profit 100
+
+# 完整参数
+python term_monitor.py --source wind --min-profit 150 --expiry-days 45 --refresh 3 --atm-range 0.10
+```
+
+| 参数 | 默认值 | 说明 |
+|------|--------|------|
+| `--source` | `wind` | `wind` 直连 / `zmq` 读 recorder |
+| `--min-profit` | `30` | 最小显示净利润（元/张） |
+| `--expiry-days` | `90` | 最大到期天数 |
+| `--refresh` | `5` | 刷新间隔（秒） |
+| `--atm-range` | `0.20` | 行权价过滤（±20%） |
+
+### 表格列说明
+
+| 列 | 含义 |
+|----|------|
+| 到期 | 到期日 MM-DD |
+| 行权价 | Strike，调整型前缀 `(A)` |
+| 方向 | 正向 / 反向 |
+| **乘数** | 真实合约乘数（非标准值高亮） |
+| C_b / C_a | Call 买一 / 卖一 |
+| P_b / P_a | Put 买一 / 卖一 |
+| S | ETF 现货价 |
+| **净利润** | 扣费后每张净利润（元），**核心决策指标** |
+| **明细** | 完整盘口公式，如 `K(3.1)-S_a(3.09)-P_a(0.03)+C_b(0.12)=...` |
+
+### 显示分区
+
+表格内按品种（50ETF / 300ETF / 500ETF）分块，每块内：
+1. **正常合约**（行权价升序）
+2. 分隔线
+3. **调整型合约 (A)**（行权价升序，乘数橙色高亮）
+
+---
+
+## 十、网页监控
+
+```bash
+python web_monitor.py                              # 默认 8080 端口
+python web_monitor.py --port 8081                   # 自定义端口
+python web_monitor.py --min-profit 100 --refresh 5
+```
+
+浏览器打开 `http://localhost:8080`，暗色主题自动刷新仪表盘。
+
+功能与终端监控一致：三品种分区、正常/调整型分区、乘数列 + 计算明细列。
+
+---
+
+## 十一、回测
+
+```bash
 python main.py --data-dir "D:\TICK_DATA\上交所\华夏上证50ETF期权" \
                --start-date 2024-01 --end-date 2024-01
 
-# 半年回测 + 图表输出
 python main.py --data-dir "D:\TICK_DATA\上交所\华夏上证50ETF期权" \
                --start-date 2024-01 --end-date 2024-06 \
-               --output-chart equity.png
-
-# 调高利润阈值（减少噪音信号）
-python main.py --data-dir "D:\TICK_DATA\上交所\华夏上证50ETF期权" \
-               --start-date 2024-01 --end-date 2024-03 \
-               --min-profit 200 --capital 2000000
+               --output-chart equity.png --min-profit 200
 ```
 
-### 回测输出指标说明
-
-| 指标 | 说明 |
-|------|------|
-| 总收益率 | 期末权益 / 初始资金 - 1 |
-| 年化收益率 | 按实际交易天数折算 |
-| 最大回撤 | 权益曲线峰值到谷底的最大跌幅 |
-| Sharpe 比率 | (年化收益 - 无风险利率) / 年化波动率 |
-| 胜率 | 盈利交易笔数 / 总交易笔数 |
-| 平均持仓时间 | 从开仓到平仓的平均 Tick 数 |
-
-> ⚠️ **注意**：回测中 ETF 价格使用 GBM 模拟（非真实数据），回测结果仅供参考，实际交易表现可能有较大偏差。
+> ⚠️ 回测中 ETF 价格使用 GBM 模拟（非真实数据），结果仅供参考。
 
 ---
 
-## 九、配置说明
+## 十二、配置说明
 
-所有参数集中在 `config/settings.py`，无需修改源码：
+所有参数集中在 `config/settings.py`，可在实例化时覆盖：
 
 ```python
-# 调整费率（适配你的券商）
+from config.settings import get_default_config
+
 config = get_default_config()
-config.fee.option_commission_per_contract = 2.0   # 元/张
-config.fee.etf_commission_rate = 0.00003          # 万0.3
-
-# 调整滑点（深度虚值期权建议加大）
-config.slippage.option_slippage_ticks = 2         # 2跳滑点
-
-# 调整无风险利率
-config.risk_free_rate = 0.015                     # 1.5%
-
-# 调整信号阈值
-config.min_profit_threshold = 150.0               # 只看≥150元的机会
+config.etf_fee_rate = 0.00015                # 万1.5
+config.option_round_trip_fee = 3.4           # 调整手续费
+config.min_profit_threshold = 100.0          # 100元以上才输出
+config.enable_reverse = True                 # 开启反向套利（需自行计算融券成本）
 ```
 
 ---
 
-## 十、数据说明
+## 十三、数据说明
 
-### 本地 Tick 数据（不在仓库中）
+### 实时数据（data_recorder 产生）
+
+每条期权 tick 包含 `is_adjusted`（是否调整型）和 `multiplier`（真实合约乘数），
+供下游研究分析使用。
+
+### 历史 Tick 数据（不在仓库中）
 
 ```
 D:\TICK_DATA\上交所\
-├── 华夏上证50ETF期权/      129个月度CSV（2015-02 ~ 2025-10）
-├── 华泰柏瑞沪深300ETF期权/  73个月度CSV（2019-12 ~ 2025-12）
-├── 南方中证500ETF期权/      40个月度CSV（2022-09 ~ 2025-12）
-├── 科创50期权/              31个月度CSV（2023-06 ~ 2025-12）
-└── 科创板50期权/            31个月度CSV（2023-06 ~ 2025-12）
+├── 华夏上证50ETF期权/      129 个月度 CSV（2015-02 ~ 2025-10）
+├── 华泰柏瑞沪深300ETF期权/  73 个月度 CSV
+├── 南方中证500ETF期权/      40 个月度 CSV
+├── 科创50期权/              31 个月度 CSV
+└── 科创板50期权/            31 个月度 CSV
 ```
 
-**文件命名格式**：`{品种名}_option_ticks_{YYYY-MM}.csv`
+### 合约信息文件
 
-### Tick 数据字段
-
-| 字段 | 类型 | 说明 |
-|------|------|------|
-| `time` | int64 | 时间戳，17位整型 `YYYYMMDDHHMMSSmmm` |
-| `current` | float | 最新价 |
-| `a1_p` ~ `a5_p` | float | 卖1~卖5价（50ETF有5档，其余1档）|
-| `b1_p` ~ `b5_p` | float | 买1~买5价 |
-| `contract_code` | str | 合约代码（`.XSHG` 后缀，框架自动转 `.SH`）|
+`info_data/上交所期权基本信息.csv`：11,102 条记录，UTF-8-BOM 编码。
+字段：证券代码、证券简称、起始交易日期、最后交易日期、交割月份、行权价格、期权类型。
 
 ---
 
-## 十一、已知限制
+## 十四、已知限制
 
-| 限制 | 说明 | 影响范围 |
-|------|------|---------|
-| ETF 数据为模拟 | 回测中用 GBM 模拟 ETF 价格，非真实数据 | 回测结果失真 |
-| Wind Level 2 权限 | 挂单量字段需要 Level 2，当前默认 100 | 置信度评分不准确 |
-| Wind wsq 数据点限制 | 单次 ≤600 数据点（194合约×3字段=582点） | 超大品种需分批 |
-| 三腿非原子执行 | A股无组合指令，存在腿差风险 | 实盘净利润可能低于预估 |
-| 反向套利不可执行 | ETF 现货 T+1，无法做空 | 反向信号仅供参考 |
-| 回测重复信号 | 同 Tick 时刻可能出现重复信号（待修复）| 回测统计偏高 |
+| 限制 | 说明 |
+|------|------|
+| ETF 回测数据为模拟 | GBM 模拟非真实价格，回测结果失真 |
+| 三腿非原子执行 | A 股无组合指令，存在腿差风险 |
+| 反向套利未计融券利息 | `enable_reverse` 默认关闭 |
+| Wind Level 2 权限 | 挂单量默认 100，置信度仅参考 |
+| 回测重复信号 | 同 Tick 可能重复，统计偏高（待修复） |
+| recorder 崩溃 | 最多丢 30 秒数据，可调小 `--flush` |

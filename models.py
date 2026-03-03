@@ -158,8 +158,9 @@ class ContractInfo:
     list_date: date             # 起始交易日期
     expiry_date: date           # 最后交易日期（到期日）
     delivery_month: str         # 交割月份，如 "201503"
-    contract_unit: int = 10000  # 合约单位（ETF 期权统一为 10000）
+    contract_unit: int = 10000  # 合约单位（标准 10000，调整型合约不等于此值）
     exchange: str = "SH"        # 交易所
+    is_adjusted: bool = False   # 是否为调整型合约（ETF 分红后产生，乘数≠10000，行权价非标准）
 
     @property
     def is_call(self) -> bool:
@@ -204,8 +205,11 @@ class TradeSignal:
     # 理论与实际价差
     theoretical_spread: float   # 理论 PCP 价差
     actual_spread: float        # 实际市场价差
-    net_profit_estimate: float  # 扣除费用后的预估净利润（每组合约）
+    net_profit_estimate: float  # 扣除费用后的预估净利润（每张合约）
     confidence: float = 0.0     # 信号置信度 [0, 1]
+    multiplier: int = 10000     # 该合约的真实乘数（标准 10000，调整型可能为 10265 等）
+    is_adjusted: bool = False   # 是否为分红调整型合约（乘数≠10000）
+    calc_detail: str = ""       # 计算明细（人可读的盘口公式字符串）
 
 
 # ============================================================

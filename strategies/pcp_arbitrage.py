@@ -1,14 +1,19 @@
 """
 Put-Call Parity 套利策略
 
-基于认沽认购平价关系 C - P = S - K*exp(-rT) 检测套利机会。
+基于认沽认购平价关系检测套利机会，严格区分买卖盘口（Bid/Ask）吃单。
 
-正向套利（Conversion）：当 C - P > S - K*exp(-rT) + costs
-  操作：买入现货 + 买入 Put + 卖出 Call
-  锁定利润 = (C_bid - P_ask) - (S_ask - K*exp(-rT)) - costs
+正向套利（Forward / Conversion）：买现货 + 买Put + 卖Call
+  理论单股利润 = K - (S_ask + P_ask - C_bid)
+  真实单张净利 = 理论单股利润 × multiplier - ETF规费 - 期权双边手续费
 
-反向套利（Reversal）：当 K*exp(-rT) - S > P - C + costs
-  操作：卖出现货 + 卖出 Put + 买入 Call（A股现货做空受限，仅记录）
+反向套利（Reverse / Reversal）：融券卖现货 + 卖Put + 买Call
+  理论单股利润 = (S_bid + P_bid - C_ask) - K
+  真实单张净利 = 理论单股利润 × multiplier - ETF规费 - 期权双边手续费
+  注意：反向套利未计融券利息，默认 enable_reverse=False 关闭。
+
+乘数（multiplier）：标准合约 10000，ETF 分红后调整型合约可能为 10265 等。
+现货对冲数量等于 multiplier（不一定是 10000 股）。
 """
 
 from __future__ import annotations
@@ -176,19 +181,14 @@ class PCPArbitrage:
         current_time: Optional[datetime] = None,
     ) -> Optional[TradeSignal]:
         """
-        评估单对 Call/Put 的套利机会
+        评估单对 Call/Put 的套利机会。
 
-        计算正向和反向两个方向的利润空间，返回利润更高的信号（如果满足阈值）。
-
-        Returns:
-            TradeSignal 或 None
+        严格使用 Bid/Ask 吃单价格，动态读取合约真实乘数。
         """
         call_tick = self.aligner.get_option_quote(call_info.contract_code)
-        put_tick = self.aligner.get_option_quote(put_info.contract_code)
-
-        # 按合约标的代码查询对应 ETF 行情（多品种支持）
+        put_tick  = self.aligner.get_option_quote(put_info.contract_code)
         underlying = call_info.underlying_code
-        etf_price = self.aligner.get_etf_price(underlying)
+        etf_price  = self.aligner.get_etf_price(underlying)
 
         if call_tick is None or put_tick is None or etf_price is None:
             return None
@@ -196,113 +196,94 @@ class PCPArbitrage:
         if current_time is None:
             current_time = max(call_tick.timestamp, put_tick.timestamp)
 
-        call_bid = call_tick.bid_prices[0]
-        call_ask = call_tick.ask_prices[0]
-        put_bid = put_tick.bid_prices[0]
-        put_ask = put_tick.ask_prices[0]
+        C_bid = call_tick.bid_prices[0]
+        C_ask = call_tick.ask_prices[0]
+        P_bid = put_tick.bid_prices[0]
+        P_ask = put_tick.ask_prices[0]
 
-        if any(math.isnan(p) for p in [call_bid, call_ask, put_bid, put_ask]):
+        if any(math.isnan(p) for p in [C_bid, C_ask, P_bid, P_ask]):
             return None
-        if any(p <= 0 for p in [call_bid, call_ask, put_bid, put_ask]):
+        if any(p <= 0 for p in [C_bid, C_ask, P_bid, P_ask]):
             return None
 
-        K = call_info.strike_price
-        T = call_info.time_to_expiry(current_time.date())
-        r = self.config.risk_free_rate
-        discount_factor = math.exp(-r * T)
-        pv_strike = K * discount_factor
+        K    = call_info.strike_price
+        mult = call_info.contract_unit                 # 真实乘数（标准 10000 或调整后）
+        T    = call_info.time_to_expiry(current_time.date())
+        r    = self.config.risk_free_rate
 
-        theoretical_spread = etf_price - pv_strike  # S - K*exp(-rT)
+        S_ask = self.aligner.get_etf_ask(underlying) or etf_price
+        S_bid = self.aligner.get_etf_bid(underlying) or etf_price
 
-        etf_ask = self.aligner.get_etf_ask(underlying) or etf_price
-        etf_bid = self.aligner.get_etf_bid(underlying) or etf_price
+        etf_fee_rate        = self.config.etf_fee_rate
+        option_rt_fee       = self.config.option_round_trip_fee
+        theoretical_spread  = etf_price - K * math.exp(-r * T)
 
-        # === 正向套利（Conversion）===
-        # 卖出 Call（得 C_bid）+ 买入 Put（付 P_ask）+ 买入现货（付 S_ask）
-        forward_revenue = call_bid - put_ask
-        forward_cost = etf_ask - pv_strike
-        forward_costs = self._estimate_costs(call_bid, put_ask, etf_ask)
-        forward_profit = (forward_revenue - forward_cost - forward_costs) * self.config.contract_unit
+        # ── 正向套利（Forward）：买现货 + 买Put + 卖Call ─────────
+        fwd_per_share  = K - (S_ask + P_ask - C_bid)
+        fwd_etf_fee    = S_ask * mult * etf_fee_rate
+        fwd_profit     = fwd_per_share * mult - fwd_etf_fee - option_rt_fee
+        fwd_detail     = (
+            f"K({K:.3g})-S_a({S_ask:.4f})-P_a({P_ask:.4f})+C_b({C_bid:.4f})"
+            f"={fwd_per_share:.4f}/股"
+        )
 
-        # === 反向套利（Reversal）===
-        # 买入 Call（付 C_ask）+ 卖出 Put（得 P_bid）+ 卖出现货（得 S_bid）
-        reverse_revenue = pv_strike - etf_bid
-        reverse_cost = put_bid - call_ask
-        reverse_costs = self._estimate_costs(call_ask, put_bid, etf_bid)
-        reverse_profit_raw = reverse_revenue + reverse_cost - reverse_costs
-        reverse_profit = reverse_profit_raw * self.config.contract_unit
+        # ── 反向套利（Reverse）：融券卖现货 + 卖Put + 买Call ─────
+        rev_per_share  = (S_bid + P_bid - C_ask) - K
+        rev_etf_fee    = S_bid * mult * etf_fee_rate
+        rev_profit     = rev_per_share * mult - rev_etf_fee - option_rt_fee
+        rev_detail     = (
+            f"S_b({S_bid:.4f})+P_b({P_bid:.4f})-C_a({C_ask:.4f})-K({K:.3g})"
+            f"={rev_per_share:.4f}/股"
+        )
 
-        best_signal: Optional[TradeSignal] = None
+        best: Optional[TradeSignal] = None
 
-        if forward_profit >= self.config.min_profit_threshold:
+        if fwd_profit >= self.config.min_profit_threshold:
             self.signal_count += 1
-            best_signal = TradeSignal(
+            best = TradeSignal(
                 timestamp=current_time,
                 signal_type=SignalType.FORWARD,
                 call_code=call_info.contract_code,
                 put_code=put_info.contract_code,
-                underlying_code=call_info.underlying_code,
+                underlying_code=underlying,
                 strike=K,
                 expiry=call_info.expiry_date,
-                call_ask=call_ask,
-                call_bid=call_bid,
-                put_ask=put_ask,
-                put_bid=put_bid,
+                call_ask=C_ask, call_bid=C_bid,
+                put_ask=P_ask,  put_bid=P_bid,
                 spot_price=etf_price,
                 theoretical_spread=theoretical_spread,
-                actual_spread=forward_revenue,
-                net_profit_estimate=forward_profit,
-                confidence=self._calc_confidence(forward_profit, call_tick, put_tick),
+                actual_spread=C_bid - P_ask,
+                net_profit_estimate=fwd_profit,
+                confidence=self._calc_confidence(fwd_profit, call_tick, put_tick),
+                multiplier=mult,
+                is_adjusted=call_info.is_adjusted,
+                calc_detail=fwd_detail,
             )
 
-        if reverse_profit >= self.config.min_profit_threshold:
-            if best_signal is None or reverse_profit > best_signal.net_profit_estimate:
+        if self.config.enable_reverse and rev_profit >= self.config.min_profit_threshold:
+            if best is None or rev_profit > best.net_profit_estimate:
                 self.signal_count += 1
-                best_signal = TradeSignal(
+                best = TradeSignal(
                     timestamp=current_time,
                     signal_type=SignalType.REVERSE,
                     call_code=call_info.contract_code,
                     put_code=put_info.contract_code,
-                    underlying_code=call_info.underlying_code,
+                    underlying_code=underlying,
                     strike=K,
                     expiry=call_info.expiry_date,
-                    call_ask=call_ask,
-                    call_bid=call_bid,
-                    put_ask=put_ask,
-                    put_bid=put_bid,
+                    call_ask=C_ask, call_bid=C_bid,
+                    put_ask=P_ask,  put_bid=P_bid,
                     spot_price=etf_price,
                     theoretical_spread=theoretical_spread,
-                    actual_spread=put_bid - call_ask,
-                    net_profit_estimate=reverse_profit,
-                    confidence=self._calc_confidence(reverse_profit, call_tick, put_tick),
+                    actual_spread=P_bid - C_ask,
+                    net_profit_estimate=rev_profit,
+                    confidence=self._calc_confidence(rev_profit, call_tick, put_tick),
+                    multiplier=mult,
+                    is_adjusted=call_info.is_adjusted,
+                    calc_detail=rev_detail,
                 )
 
-        return best_signal
-
-    def _estimate_costs(
-        self,
-        option_price_1: float,
-        option_price_2: float,
-        etf_price: float,
-    ) -> float:
-        """
-        估算单组套利的交易成本（每份合约单位）
-
-        包含：期权手续费（双边2张） + ETF 佣金 + 滑点
-        """
-        fee = self.config.fee
-        slp = self.config.slippage
-        unit = self.config.contract_unit
-
-        option_commission = 2.0 * fee.option_commission_per_contract / unit
-
-        etf_turnover = etf_price * unit
-        etf_commission = max(etf_turnover * fee.etf_commission_rate, fee.etf_min_commission) / unit
-
-        option_slippage = 2.0 * slp.option_slippage_ticks * slp.option_tick_size
-        etf_slippage = slp.etf_slippage_ticks * slp.etf_tick_size
-
-        return option_commission + etf_commission + option_slippage + etf_slippage
+        return best
 
     @staticmethod
     def _calc_confidence(
@@ -310,15 +291,11 @@ class PCPArbitrage:
         call_tick: TickData,
         put_tick: TickData,
     ) -> float:
-        """
-        计算信号置信度
-
-        综合考虑：利润大小、盘口价差、盘口挂单量。
-        """
+        """综合置信度：利润大小 + 盘口价差 + 挂单量"""
         profit_score = min(profit / 500.0, 1.0)
 
         call_spread = call_tick.spread
-        put_spread = put_tick.spread
+        put_spread  = put_tick.spread
         if math.isnan(call_spread) or math.isnan(put_spread):
             spread_score = 0.3
         else:

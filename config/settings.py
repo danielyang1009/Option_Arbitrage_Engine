@@ -81,12 +81,63 @@ class TradingConfig:
     # 信号过滤阈值
     min_profit_threshold: float = 50.0             # 最小净利润阈值（元/组）
     min_volume_threshold: int = 10                 # 最小成交量过滤
+    enable_reverse: bool = False                   # 是否输出反向套利信号（融券卖出，未计息成本，默认关闭）
+
+    # PCP 套利成本参数（简化公式，见 pcp_arbitrage.py 说明）
+    etf_fee_rate: float = 0.00020                  # ETF 现货单边规费（含佣金+过户费，约万2）
+    option_round_trip_fee: float = 3.0             # 期权双边手续费（卖Call 1.7 + 买Put 1.3 ≈ 3 元/张）
 
     # ETF 模拟器参数
     simulation_volatility: float = 0.20            # 模拟波动率
     simulation_drift: float = 0.03                 # 模拟漂移率
 
 
+@dataclass
+class RecorderConfig:
+    """
+    数据记录进程配置
+
+    控制 Wind 订阅品种、存储路径、分片写入间隔、ZMQ 发布端口等。
+    """
+    # 监控品种（不含科创板两个品种）
+    products: list = field(default_factory=lambda: [
+        "510050.SH",   # 50ETF
+        "510300.SH",   # 300ETF（华泰）
+        "510500.SH",   # 500ETF（南方）
+    ])
+
+    # Wind 订阅字段
+    option_fields: str = "rt_last,rt_ask1,rt_bid1,rt_oi,rt_vol,rt_high,rt_low"
+    etf_fields: str    = "rt_last,rt_ask1,rt_bid1"
+
+    # 存储路径
+    output_dir: str = r"D:\MARKET_DATA"
+
+    # ZeroMQ 发布端口
+    zmq_port: int = 5555
+
+    # 分片写入间隔（秒）：每隔此时间将内存缓冲区写为一个完整 Parquet 分片
+    flush_interval_secs: int = 30
+
+    # Wind wsq 单批代码上限（7字段时 80×7=560 < 600 数据点限制）
+    batch_size: int = 80
+
+    # 日终合并触发时间（交易结束后自动合并当日所有分片）
+    merge_hour: int = 15
+    merge_minute: int = 10
+
+    # 内存 tick 队列最大容量（防止 Wind 回调过快导致内存溢出）
+    queue_maxsize: int = 200_000
+
+    # 合约到期天数上限（记录所有 365 天内到期的合约，即全部上市合约）
+    max_expiry_days: int = 365
+
+
 def get_default_config() -> TradingConfig:
     """获取默认配置实例"""
     return TradingConfig()
+
+
+def get_recorder_config() -> RecorderConfig:
+    """获取数据记录进程默认配置实例"""
+    return RecorderConfig()
