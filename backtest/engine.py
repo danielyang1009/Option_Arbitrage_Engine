@@ -86,6 +86,7 @@ class Account:
         contracts: Dict[str, ContractInfo],
         underlying_close: float,
         num_sets: int = 1,
+        signal_id: Optional[int] = None,
     ) -> List[TradeRecord]:
         """
         执行套利信号
@@ -152,6 +153,7 @@ class Account:
                 signal.timestamp, AssetType.ETF, signal.underlying_code,
                 OrderSide.BUY, etf_exec_price, etf_quantity, etf_comm,
                 slp.etf_slippage_ticks * slp.etf_tick_size * etf_quantity,
+                signal_id=signal_id,
             ))
             self._update_position(
                 signal.underlying_code, AssetType.ETF,
@@ -165,6 +167,7 @@ class Account:
                 signal.timestamp, AssetType.OPTION, signal.put_code,
                 OrderSide.BUY, put_exec_price, num_sets, put_comm,
                 slp.option_slippage_ticks * slp.option_tick_size * unit * num_sets,
+                signal_id=signal_id,
             ))
             self._update_position(
                 signal.put_code, AssetType.OPTION,
@@ -177,6 +180,7 @@ class Account:
                 signal.timestamp, AssetType.OPTION, signal.call_code,
                 OrderSide.SELL, call_exec_price, num_sets, call_comm,
                 slp.option_slippage_ticks * slp.option_tick_size * unit * num_sets,
+                signal_id=signal_id,
             ))
             self._update_position(
                 signal.call_code, AssetType.OPTION,
@@ -306,6 +310,7 @@ class Account:
         quantity: int,
         commission: float,
         slippage_cost: float,
+        signal_id: Optional[int] = None,
     ) -> TradeRecord:
         """记录成交"""
         self._trade_counter += 1
@@ -321,6 +326,7 @@ class Account:
             quantity=quantity,
             commission=commission,
             slippage_cost=slippage_cost,
+            signal_id=signal_id,
         )
         self.trade_history.append(record)
         return record
@@ -352,6 +358,7 @@ class BacktestEngine:
         self.margin_calculator = MarginCalculator(config)
         self.signals_generated: List[TradeSignal] = []
         self.equity_curve: List[Tuple[datetime, float]] = []
+        self._price_cache: Dict[str, float] = {}
 
     def run(
         self,
@@ -390,6 +397,7 @@ class BacktestEngine:
             signals = strategy_callback(mtick, self)
 
             for signal in signals:
+                sig_idx = len(self.signals_generated)
                 self.signals_generated.append(signal)
                 total_signals += 1
 
@@ -403,6 +411,7 @@ class BacktestEngine:
                 trades = self.account.execute_signal(
                     signal, self.margin_calculator, contracts,
                     underlying_close or 0, num_sets,
+                    signal_id=sig_idx,
                 )
                 total_trades += len(trades)
 
@@ -468,12 +477,10 @@ class BacktestEngine:
         max_sets = int(self.account.cash * 0.8 / cost_per_set)
         return max(0, min(max_sets, self.config.max_position_per_signal))
 
-    @staticmethod
-    def _get_latest_prices(mtick: MergedTick) -> Dict[str, float]:
-        """从最新 Tick 提取价格映射"""
-        prices: Dict[str, float] = {}
+    def _get_latest_prices(self, mtick: MergedTick) -> Dict[str, float]:
+        """逐 Tick 更新价格缓存，返回全量快照供持仓估值使用"""
         if mtick.option_tick is not None:
-            prices[mtick.option_tick.contract_code] = mtick.option_tick.current
+            self._price_cache[mtick.option_tick.contract_code] = mtick.option_tick.current
         if mtick.etf_tick is not None:
-            prices[mtick.etf_tick.etf_code] = mtick.etf_tick.price
-        return prices
+            self._price_cache[mtick.etf_tick.etf_code] = mtick.etf_tick.price
+        return self._price_cache

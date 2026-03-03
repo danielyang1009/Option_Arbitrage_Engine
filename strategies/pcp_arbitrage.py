@@ -21,18 +21,16 @@ from __future__ import annotations
 import logging
 import math
 from collections import defaultdict
-from datetime import date, datetime
+from datetime import datetime
 from typing import Dict, List, Optional, Tuple
 
 from config.settings import TradingConfig
 from models import (
     ContractInfo,
     ETFTickData,
-    OptionType,
     SignalType,
     TickData,
     TradeSignal,
-    normalize_code,
 )
 
 logger = logging.getLogger(__name__)
@@ -69,43 +67,30 @@ class TickAligner:
         """获取指定合约的最新报价"""
         return self.latest_option_quotes.get(code)
 
-    def get_etf_price(self, underlying_code: Optional[str] = None) -> Optional[float]:
-        """
-        获取 ETF 最新价格
+    def _get_etf_quote(self, underlying_code: Optional[str] = None) -> Optional[ETFTickData]:
+        """获取指定（或最近更新的）ETF 行情快照"""
+        if underlying_code:
+            return self.latest_etf_quotes.get(underlying_code)
+        return self.latest_etf_quote
 
-        Args:
-            underlying_code: ETF 代码（如 '510050.SH'）。不传则返回最近更新的 ETF 价格。
-        """
-        quote = (
-            self.latest_etf_quotes.get(underlying_code)
-            if underlying_code
-            else self.latest_etf_quote
-        )
+    def get_etf_price(self, underlying_code: Optional[str] = None) -> Optional[float]:
+        """获取 ETF 最新价格"""
+        quote = self._get_etf_quote(underlying_code)
         return quote.price if quote is not None else None
 
     def get_etf_ask(self, underlying_code: Optional[str] = None) -> Optional[float]:
-        """获取 ETF 卖一价"""
-        quote = (
-            self.latest_etf_quotes.get(underlying_code)
-            if underlying_code
-            else self.latest_etf_quote
-        )
+        """获取 ETF 卖一价（NaN 时回退到 last）"""
+        quote = self._get_etf_quote(underlying_code)
         if quote is None:
             return None
-        price = quote.ask_price
-        return price if not math.isnan(price) else quote.price
+        return quote.ask_price if not math.isnan(quote.ask_price) else quote.price
 
     def get_etf_bid(self, underlying_code: Optional[str] = None) -> Optional[float]:
-        """获取 ETF 买一价"""
-        quote = (
-            self.latest_etf_quotes.get(underlying_code)
-            if underlying_code
-            else self.latest_etf_quote
-        )
+        """获取 ETF 买一价（NaN 时回退到 last）"""
+        quote = self._get_etf_quote(underlying_code)
         if quote is None:
             return None
-        price = quote.bid_price
-        return price if not math.isnan(price) else quote.price
+        return quote.bid_price if not math.isnan(quote.bid_price) else quote.price
 
     def reset(self) -> None:
         """清空所有快照"""
@@ -172,6 +157,7 @@ class PCPArbitrage:
                 signals.append(signal)
 
         signals.sort(key=lambda s: s.net_profit_estimate, reverse=True)
+        self.signal_count += len(signals)
         return signals
 
     def _evaluate_pair(
@@ -185,6 +171,20 @@ class PCPArbitrage:
 
         严格使用 Bid/Ask 吃单价格，动态读取合约真实乘数。
         """
+        if (
+            call_info.strike_price != put_info.strike_price
+            or call_info.expiry_date != put_info.expiry_date
+            or call_info.underlying_code != put_info.underlying_code
+        ):
+            logger.warning(
+                "配对校验失败: Call=%s Put=%s (K=%.4f/%.4f, exp=%s/%s, und=%s/%s)",
+                call_info.contract_code, put_info.contract_code,
+                call_info.strike_price, put_info.strike_price,
+                call_info.expiry_date, put_info.expiry_date,
+                call_info.underlying_code, put_info.underlying_code,
+            )
+            return None
+
         call_tick = self.aligner.get_option_quote(call_info.contract_code)
         put_tick  = self.aligner.get_option_quote(put_info.contract_code)
         underlying = call_info.underlying_code
@@ -211,8 +211,10 @@ class PCPArbitrage:
         T    = call_info.time_to_expiry(current_time.date())
         r    = self.config.risk_free_rate
 
-        S_ask = self.aligner.get_etf_ask(underlying) or etf_price
-        S_bid = self.aligner.get_etf_bid(underlying) or etf_price
+        _s_ask = self.aligner.get_etf_ask(underlying)
+        S_ask = _s_ask if _s_ask is not None else etf_price
+        _s_bid = self.aligner.get_etf_bid(underlying)
+        S_bid = _s_bid if _s_bid is not None else etf_price
 
         etf_fee_rate        = self.config.etf_fee_rate
         option_rt_fee       = self.config.option_round_trip_fee
@@ -239,7 +241,6 @@ class PCPArbitrage:
         best: Optional[TradeSignal] = None
 
         if fwd_profit >= self.config.min_profit_threshold:
-            self.signal_count += 1
             best = TradeSignal(
                 timestamp=current_time,
                 signal_type=SignalType.FORWARD,
@@ -262,7 +263,6 @@ class PCPArbitrage:
 
         if self.config.enable_reverse and rev_profit >= self.config.min_profit_threshold:
             if best is None or rev_profit > best.net_profit_estimate:
-                self.signal_count += 1
                 best = TradeSignal(
                     timestamp=current_time,
                     signal_type=SignalType.REVERSE,

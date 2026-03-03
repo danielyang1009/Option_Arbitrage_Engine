@@ -13,44 +13,31 @@ PCP 套利实时监控 —— 网页版
 from __future__ import annotations
 
 import argparse
-import ctypes
-import io
-import json
 import logging
 import math
-import os
 import sys
 import threading
 import time
-from collections import defaultdict
-from datetime import datetime, timedelta
+from datetime import datetime
 from pathlib import Path
 from typing import Dict, List
 
-# ── Windows UTF-8 ─────────────────────────────────────────────────────────
-if sys.platform == "win32":
-    ctypes.windll.kernel32.SetConsoleOutputCP(65001)
-    ctypes.windll.kernel32.SetConsoleCP(65001)
-    try:
-        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
-        sys.stderr.reconfigure(encoding="utf-8", errors="replace")
-    except AttributeError:
-        sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", errors="replace")
-        sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding="utf-8", errors="replace")
-    os.environ["PYTHONIOENCODING"] = "utf-8"
+from monitor_common import fix_windows_encoding
+fix_windows_encoding()
 
 sys.path.insert(0, str(Path(__file__).parent))
 
-from flask import Flask, jsonify, render_template_string, request
+from flask import Flask, jsonify, render_template_string
 
-from config.settings import get_default_config
-from data_engine.contract_info import ContractInfoManager
-from data_recorder.parquet_writer import ParquetWriter
-from models import (
-    ContractInfo, ETFTickData, OptionType,
-    SignalType, TickData, TradeSignal, normalize_code,
+from monitor_common import (
+    ETF_NAME_MAP,
+    ETF_ORDER,
+    init_strategy_and_contracts,
+    parse_zmq_message,
+    restore_from_snapshot,
+    signal_to_dict,
 )
-from strategies.pcp_arbitrage import PCPArbitrage
+from models import ETFTickData, TickData
 
 logging.basicConfig(
     level=logging.INFO,
@@ -60,130 +47,20 @@ logging.basicConfig(
 )
 log = logging.getLogger("web_monitor")
 
-CONTRACT_INFO_CSV = Path(__file__).parent / "info_data" / "上交所期权基本信息.csv"
-ETF_NAME_MAP: Dict[str, str] = {
-    "510050": "50ETF",
-    "510300": "300ETF",
-    "510500": "500ETF",
-    "588000": "科创50",
-    "588050": "科创板50",
-}
-ETF_ORDER = ["510050.SH", "510300.SH", "510500.SH"]
-
 # ──────────────────────────────────────────────────────────────────────────
 # 全局共享状态（后台线程写，Flask 线程读）
 # ──────────────────────────────────────────────────────────────────────────
-_lock    = threading.Lock()
+_lock = threading.Lock()
 _state: Dict = {
-    "signals":    [],          # List[dict] 已序列化的信号
-    "etf_prices": {},          # {code: float}
-    "n_pairs":    0,
-    "n_options":  0,
+    "signals": [],
+    "etf_prices": {},
+    "n_pairs": 0,
+    "n_options": 0,
     "tick_count": 0,
-    "last_scan":  None,        # datetime
-    "status":     "初始化中",
-    "errors":     [],
+    "last_scan": None,
+    "status": "初始化中",
+    "errors": [],
 }
-
-
-def _load_active_contracts(mgr: ContractInfoManager, expiry_days: int) -> List[ContractInfo]:
-    """活跃合约：三大品种，包含调整型（由前端分区展示）"""
-    today  = datetime.today().date()
-    cutoff = today + timedelta(days=expiry_days)
-    result = []
-    for underlying in ETF_ORDER:
-        for c in mgr.get_contracts_by_underlying(underlying):
-            if c.expiry_date and today <= c.expiry_date <= cutoff:
-                result.append(c)
-    return result
-
-
-def _build_pairs_and_codes(mgr, active, etf_prices, atm_range):
-    by_key: Dict = defaultdict(dict)
-    for c in active:
-        key = (c.underlying_code, c.expiry_date, c.strike_price)
-        by_key[key][c.option_type] = c
-
-    pairs, codes = [], set()
-    etf_px = etf_prices
-    for key, d in by_key.items():
-        call = d.get(OptionType.CALL)
-        put  = d.get(OptionType.PUT)
-        if not call or not put:
-            continue
-        underlying = key[0]
-        spot = etf_px.get(underlying, 0.0)
-        if spot > 0 and atm_range > 0:
-            if abs(key[2] - spot) / spot > atm_range:
-                continue
-        pairs.append((call, put))
-        codes.add(call.contract_code)
-        codes.add(put.contract_code)
-    return pairs, sorted(codes)
-
-
-def _restore_snapshot(strategy: PCPArbitrage, snapshot_dir: str, etf_prices: dict) -> int:
-    snap = Path(snapshot_dir) / "snapshot_latest.parquet"
-    if not snap.exists():
-        return 0
-    try:
-        import pandas as pd
-        df = pd.read_parquet(snap)
-        count = 0
-        for _, row in df.iterrows():
-            ts = datetime.fromtimestamp(row["ts"] / 1000) if row["ts"] > 1e10 else datetime.fromtimestamp(row["ts"])
-            typ = row.get("type", "opt")
-            if typ == "etf":
-                t = ETFTickData(
-                    timestamp=ts, etf_code=row["code"],
-                    price=float(row.get("last", 0) or 0),
-                    ask_price=float(row.get("ask1", math.nan) or math.nan),
-                    bid_price=float(row.get("bid1", math.nan) or math.nan),
-                    is_simulated=False,
-                )
-                if t.price > 0:
-                    strategy.on_etf_tick(t)
-                    etf_prices[row["code"]] = t.price
-            else:
-                last = float(row.get("last", 0) or 0)
-                ask1 = float(row.get("ask1", math.nan) or math.nan)
-                bid1 = float(row.get("bid1", math.nan) or math.nan)
-                if last <= 0 or math.isnan(ask1) or math.isnan(bid1):
-                    continue
-                t = TickData(
-                    timestamp=ts, contract_code=row["code"],
-                    current=last, volume=0, high=last, low=last, money=0.0, position=0,
-                    ask_prices=[ask1] + [math.nan] * 4, ask_volumes=[100] * 5,
-                    bid_prices=[bid1] + [math.nan] * 4, bid_volumes=[100] * 5,
-                )
-                strategy.on_option_tick(t)
-            count += 1
-        return count
-    except Exception as e:
-        log.warning("快照恢复失败: %s", e)
-        return 0
-
-
-def _signal_to_dict(sig: TradeSignal) -> dict:
-    return {
-        "expiry":       sig.expiry.strftime("%m-%d"),
-        "strike":       sig.strike,
-        "direction":    "正向" if sig.signal_type == SignalType.FORWARD else "反向",
-        "is_forward":   sig.signal_type == SignalType.FORWARD,
-        "call_bid":     sig.call_bid,
-        "call_ask":     sig.call_ask,
-        "put_bid":      sig.put_bid,
-        "put_ask":      sig.put_ask,
-        "spot":         sig.spot_price,
-        "profit":       round(sig.net_profit_estimate, 0),
-        "confidence":   round(sig.confidence, 2),
-        "underlying":   sig.underlying_code,
-        "call_code":    sig.call_code,
-        "put_code":     sig.put_code,
-        "multiplier":   sig.multiplier,
-        "is_adjusted":  sig.is_adjusted,
-        "calc_detail":  sig.calc_detail,
-    }
 
 
 # ──────────────────────────────────────────────────────────────────────────
@@ -204,71 +81,54 @@ def _zmq_worker(
             _state["status"] = "错误：pyzmq 未安装"
         return
 
-    # 初始化策略
-    config = get_default_config()
-    config.min_profit_threshold = min_profit
-    strategy  = PCPArbitrage(config)
-    mgr       = ContractInfoManager()
+    etf_prices: Dict[str, float] = {}
+    n_snap = 0
 
-    if not CONTRACT_INFO_CSV.exists():
+    try:
+        from config.settings import get_default_config
+        from strategies.pcp_arbitrage import PCPArbitrage
+
+        tmp_config = get_default_config()
+        tmp_config.min_profit_threshold = min_profit
+        tmp_strategy = PCPArbitrage(tmp_config)
+        n_snap = restore_from_snapshot(tmp_strategy, snapshot_dir, etf_prices)
+        log.info("快照恢复 %d 条", n_snap)
+
+        strategy, mgr, active, pairs, option_codes, etf_codes = (
+            init_strategy_and_contracts(
+                min_profit, expiry_days, atm_range, etf_prices,
+                log_fn=log.info,
+            )
+        )
+    except (FileNotFoundError, RuntimeError) as e:
         with _lock:
-            _state["status"] = f"错误：合约信息文件不存在 {CONTRACT_INFO_CSV}"
+            _state["status"] = f"错误：{e}"
         return
 
-    mgr.load_from_csv(CONTRACT_INFO_CSV)
-    log.info("合约信息加载完成")
-
-    etf_prices: Dict[str, float] = {}
-    n_snap = _restore_snapshot(strategy, snapshot_dir, etf_prices)
-    log.info("快照恢复 %d 条", n_snap)
-
-    for code in ETF_ORDER:
-        if code not in etf_prices:
-            strikes = [c.strike_price for c in mgr.get_contracts_by_underlying(code)]
-            if strikes:
-                etf_prices[code] = (min(strikes) + max(strikes)) / 2
-
-    active = _load_active_contracts(mgr, expiry_days)
-
-    # 通过 Wind 查询真实合约乘数
-    try:
-        active_codes = [c.contract_code for c in active]
-        n_mult = mgr.load_multipliers_from_wind(active_codes)
-        if n_mult > 0:
-            log.info("已从 Wind 更新 %d 个合约的真实乘数", n_mult)
-    except Exception as e:
-        log.warning("Wind 乘数查询跳过: %s", e)
-
-    pairs, option_codes = _build_pairs_and_codes(mgr, active, etf_prices, atm_range)
-    log.info("活跃合约 %d，配对 %d，监控期权 %d", len(active), len(pairs), len(option_codes))
+    if n_snap > 0:
+        restore_from_snapshot(strategy, snapshot_dir, etf_prices)
 
     with _lock:
-        _state["n_pairs"]   = len(pairs)
+        _state["n_pairs"] = len(pairs)
         _state["n_options"] = len(option_codes)
-        _state["status"]    = "运行中"
+        _state["etf_prices"] = dict(etf_prices)
+        _state["status"] = "运行中"
 
-    # 连接 ZMQ
-    ctx  = zmq.Context.instance()
+    ctx = zmq.Context.instance()
     sock = ctx.socket(zmq.SUB)
     sock.connect(f"tcp://127.0.0.1:{zmq_port}")
     sock.setsockopt_string(zmq.SUBSCRIBE, "")
     sock.setsockopt(zmq.RCVTIMEO, 100)
     log.info("ZMQ 已连接 tcp://127.0.0.1:%d", zmq_port)
 
-    last_scan      = datetime.now()
+    last_scan = datetime.now()
     last_heartbeat = datetime.now()
-    tick_counter   = 0
-
-    # 立即把快照里的 etf_prices 写入 _state（不等第一次扫描）
-    with _lock:
-        _state["etf_prices"] = dict(etf_prices)
-        _state["status"]     = "运行中"
+    tick_counter = 0
 
     log.info("进入主循环，等待 ZMQ 消息...")
 
     while True:
         try:
-            # ── 消费 ZMQ 消息（每次最多 500 条）─────────────────────────
             for _ in range(500):
                 try:
                     raw = sock.recv_string()
@@ -277,63 +137,54 @@ def _zmq_worker(
                 except zmq.ZMQError as e:
                     log.warning("ZMQ 接收错误: %s", e)
                     break
-                try:
-                    _, _, body = raw.partition(" ")
-                    d = json.loads(body)
-                    ts = datetime.fromtimestamp(d["ts"] / 1000)
-                    if d.get("type") == "etf":
-                        last = d.get("last") or 0
-                        if last > 0:
-                            t = ETFTickData(
-                                timestamp=ts, etf_code=d["code"], price=float(last),
-                                ask_price=float(d.get("ask1") or math.nan),
-                                bid_price=float(d.get("bid1") or math.nan),
-                                is_simulated=False,
-                            )
-                            strategy.on_etf_tick(t)
-                            etf_prices[d["code"]] = t.price
-                    else:
-                        last = d.get("last") or 0
-                        ask1 = d.get("ask1") or math.nan
-                        bid1 = d.get("bid1") or math.nan
-                        if last > 0 and not math.isnan(float(ask1)) and not math.isnan(float(bid1)):
-                            t = TickData(
-                                timestamp=ts, contract_code=d["code"],
-                                current=float(last), volume=0,
-                                high=float(last), low=float(last), money=0.0, position=0,
-                                ask_prices=[float(ask1)] + [math.nan] * 4, ask_volumes=[100] * 5,
-                                bid_prices=[float(bid1)] + [math.nan] * 4, bid_volumes=[100] * 5,
-                            )
-                            strategy.on_option_tick(t)
+
+                tick = parse_zmq_message(raw)
+                if tick is not None:
+                    if isinstance(tick, ETFTickData):
+                        strategy.on_etf_tick(tick)
+                        etf_prices[tick.etf_code] = tick.price
+                    elif isinstance(tick, TickData):
+                        strategy.on_option_tick(tick)
                     tick_counter += 1
-                except Exception as e:
-                    log.debug("消息解析跳过: %s", e)
 
             now = datetime.now()
 
-            # ── 心跳日志（每 30 秒）──────────────────────────────────────
             if (now - last_heartbeat).total_seconds() >= 30:
-                log.info("心跳 %s | tick=%d | etf_prices=%s",
-                         now.strftime("%H:%M:%S"), tick_counter,
-                         {k.split(".")[0]: f"{v:.4f}" for k, v in etf_prices.items()})
+                log.info(
+                    "心跳 %s | tick=%d | etf_prices=%s",
+                    now.strftime("%H:%M:%S"),
+                    tick_counter,
+                    {k.split(".")[0]: f"{v:.4f}" for k, v in etf_prices.items()},
+                )
                 last_heartbeat = now
 
-            # ── 定期扫描 PCP ─────────────────────────────────────────────
             if (now - last_scan).total_seconds() >= refresh_secs:
                 try:
                     sigs = strategy.scan_opportunities(pairs, current_time=now)
-                    filtered = [s for s in sigs if s.net_profit_estimate >= min_profit]
+                    filtered = [
+                        s for s in sigs if s.net_profit_estimate >= min_profit
+                    ]
                     etf_rank = {c: i for i, c in enumerate(ETF_ORDER)}
-                    filtered.sort(key=lambda s: (etf_rank.get(s.underlying_code, 99), s.expiry, s.strike))
-                    serialized = [_signal_to_dict(s) for s in filtered]
+                    filtered.sort(
+                        key=lambda s: (
+                            etf_rank.get(s.underlying_code, 99),
+                            s.expiry,
+                            s.strike,
+                        )
+                    )
+                    serialized = [signal_to_dict(s) for s in filtered]
                     with _lock:
-                        _state["signals"]    = serialized
+                        _state["signals"] = serialized
                         _state["etf_prices"] = dict(etf_prices)
                         _state["tick_count"] = tick_counter
-                        _state["last_scan"]  = now.strftime("%H:%M:%S")
-                        _state["status"]     = "运行中"
-                    log.info("扫描完成 %s | 信号 %d 条 | tick累计 %d",
-                             now.strftime("%H:%M:%S"), len(serialized), tick_counter)
+                        _state["last_scan"] = now.strftime("%H:%M:%S")
+                        _state["status"] = "运行中"
+                    log.info(
+                        "扫描完成 %s | 信号 %d 条 | tick累计 %d",
+                        now.strftime("%H:%M:%S"),
+                        len(serialized),
+                        tick_counter,
+                    )
                 except Exception as e:
                     log.error("PCP 扫描异常: %s", e, exc_info=True)
                 last_scan = now
@@ -376,7 +227,6 @@ _HTML_TEMPLATE = """<!DOCTYPE html>
   * { box-sizing: border-box; margin: 0; padding: 0; }
   body { background: var(--bg); color: var(--text); font-family: 'Consolas','Menlo','Monaco',monospace; font-size: 13px; }
 
-  /* ── 顶部状态栏 ── */
   #header {
     background: var(--bg2);
     border-bottom: 1px solid var(--border);
@@ -396,10 +246,8 @@ _HTML_TEMPLATE = """<!DOCTYPE html>
   #header .status-dot { width: 8px; height: 8px; border-radius: 50%; background: var(--green); display: inline-block; margin-right: 4px; }
   #header .status-dot.stale { background: var(--yellow); }
 
-  /* ── 主体 ── */
   #main { padding: 16px 20px; display: flex; flex-direction: column; gap: 16px; }
 
-  /* ── 品种卡片 ── */
   .card {
     background: var(--bg2);
     border: 1px solid var(--border);
@@ -422,7 +270,6 @@ _HTML_TEMPLATE = """<!DOCTYPE html>
   .badge.rev  { background: rgba(139,148,158,0.1);  color: var(--dim);   border: 1px solid var(--border); }
   .badge.none { background: rgba(139,148,158,0.08); color: var(--dim);   border: 1px solid var(--border); }
 
-  /* ── 表格 ── */
   .tbl-wrap { overflow-x: auto; }
   table { width: 100%; border-collapse: collapse; }
   thead th {
@@ -444,23 +291,19 @@ _HTML_TEMPLATE = """<!DOCTYPE html>
 
   .no-signal { padding: 14px 16px; color: var(--dim); font-style: italic; }
 
-  /* ── 利润颜色 ── */
   .profit-hi  { color: var(--bgreen); font-weight: bold; }
   .profit-mid { color: var(--green);  font-weight: bold; }
   .profit-lo  { color: var(--yellow); }
 
-  /* ── 方向标签 ── */
   .dir-fwd { color: var(--bgreen); font-weight: bold; }
   .dir-rev { color: var(--dim); font-style: italic; }
 
   .row-adj td { opacity: 0.75; }
   .section-sep td { padding: 2px 0 !important; }
 
-  /* ── 刷新动画 ── */
   @keyframes pulse { 0%,100%{opacity:1} 50%{opacity:.4} }
   .refreshing { animation: pulse 0.6s ease-in-out; }
 
-  /* ── 底部 ── */
   #footer { text-align: center; color: var(--dim); font-size: 11px; padding: 16px; }
 </style>
 </head>
@@ -570,23 +413,19 @@ async function refresh() {
     const res = await fetch('/api/signals');
     const data = await res.json();
 
-    // 顶栏更新
     document.getElementById('status-dot').className = 'status-dot';
     document.getElementById('status-text').textContent = data.status || '运行中';
     document.getElementById('last-scan').textContent  = data.last_scan || '—';
     document.getElementById('tick-count').textContent = (data.tick_count || 0).toLocaleString();
 
-    // ETF 价格
     const priceEl = document.getElementById('etf-prices');
     let pHtml = '';
-    (data.etf_prices || {});
     ETF_CODES.forEach(code => {
       const p = (data.etf_prices || {})[code + '.SH'];
       if (p) pHtml += `<div class="etf-item"><span class="etf-name">${ETF_NAMES[code]}</span><span class="etf-val">${Number(p).toFixed(4)}</span></div>`;
     });
     priceEl.innerHTML = pHtml;
 
-    // 按品种分组
     const groups = {};
     ETF_CODES.forEach(c => { groups[c + '.SH'] = []; });
     (data.signals || []).forEach(s => {
@@ -601,12 +440,10 @@ async function refresh() {
       const nRev  = sigs.length - nFwd;
       totalSigs  += sigs.length;
 
-      // 价格
       const prEl = document.getElementById('p-' + code);
       const px   = (data.etf_prices || {})[underlying];
       if (prEl && px) prEl.textContent = Number(px).toFixed(4);
 
-      // 徽章
       const badge = document.getElementById('b-' + code);
       if (badge) {
         if (nFwd > 0) {
@@ -621,13 +458,11 @@ async function refresh() {
         }
       }
 
-      // 卡片边框
       const card = document.getElementById('card-' + ETF_NAMES[code]);
       if (card) {
         card.className = nFwd > 0 ? 'card has-forward' : 'card';
       }
 
-      // 表格
       const tblEl = document.getElementById('t-' + code);
       if (tblEl) {
         const tbl = buildTable(sigs);
@@ -639,7 +474,6 @@ async function refresh() {
 
     document.getElementById('total-signals').textContent = totalSigs;
 
-    // 闪烁动画
     document.getElementById('main').classList.add('refreshing');
     setTimeout(() => document.getElementById('main').classList.remove('refreshing'), 600);
 
@@ -651,14 +485,12 @@ async function refresh() {
   }
 }
 
-// 倒计时 + 定时刷新
 setInterval(() => {
   countdown -= 1;
   document.getElementById('countdown').textContent = countdown + 's';
   if (countdown <= 0) refresh();
 }, 1000);
 
-// 首次加载
 refresh();
 </script>
 </body>
@@ -675,13 +507,13 @@ def index():
 def api_signals():
     with _lock:
         return jsonify({
-            "signals":    _state["signals"],
+            "signals": _state["signals"],
             "etf_prices": {k: v for k, v in _state["etf_prices"].items()},
-            "n_pairs":    _state["n_pairs"],
-            "n_options":  _state["n_options"],
+            "n_pairs": _state["n_pairs"],
+            "n_options": _state["n_options"],
             "tick_count": _state["tick_count"],
-            "last_scan":  _state["last_scan"],
-            "status":     _state["status"],
+            "last_scan": _state["last_scan"],
+            "status": _state["status"],
         })
 
 
@@ -696,13 +528,13 @@ def api_status():
 # ──────────────────────────────────────────────────────────────────────────
 def _parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="PCP 套利网页版监控")
-    p.add_argument("--port",        type=int,   default=8080,            help="网页端口（默认8080）")
-    p.add_argument("--zmq-port",    type=int,   default=5555,            help="ZMQ PUB 端口（默认5555）")
-    p.add_argument("--min-profit",  type=float, default=100.0,           help="最小净利润显示阈值（元，默认100）")
-    p.add_argument("--expiry-days", type=int,   default=90,              help="最大到期天数（默认90）")
-    p.add_argument("--atm-range",   type=float, default=0.20,            help="ATM 距离过滤（默认±20%%）")
-    p.add_argument("--refresh",     type=int,   default=5,               help="前端刷新间隔（秒，默认5）")
-    p.add_argument("--snapshot-dir",type=str,   default=r"D:\MARKET_DATA", help="snapshot_latest.parquet 目录")
+    p.add_argument("--port", type=int, default=8080, help="网页端口")
+    p.add_argument("--zmq-port", type=int, default=5555, help="ZMQ PUB 端口")
+    p.add_argument("--min-profit", type=float, default=100.0, help="最小净利润显示阈值（元）")
+    p.add_argument("--expiry-days", type=int, default=90, help="最大到期天数")
+    p.add_argument("--atm-range", type=float, default=0.20, help="ATM 距离过滤")
+    p.add_argument("--refresh", type=int, default=5, help="前端刷新间隔（秒）")
+    p.add_argument("--snapshot-dir", type=str, default=r"D:\MARKET_DATA", help="快照目录")
     return p.parse_args()
 
 
@@ -720,15 +552,15 @@ if __name__ == "__main__":
 
     app.config["REFRESH_SECS"] = args.refresh
 
-    # 启动后台 ZMQ 线程
     t = threading.Thread(
         target=_zmq_worker,
-        args=(args.zmq_port, args.snapshot_dir, args.min_profit,
-              args.expiry_days, args.atm_range, args.refresh),
+        args=(
+            args.zmq_port, args.snapshot_dir, args.min_profit,
+            args.expiry_days, args.atm_range, args.refresh,
+        ),
         daemon=True,
         name="zmq-worker",
     )
     t.start()
 
-    # 启动 Flask（关闭重载器，避免双进程）
     app.run(host="0.0.0.0", port=args.port, debug=False, use_reloader=False)

@@ -8,13 +8,16 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from pathlib import Path
-from typing import Dict
+from typing import Dict, List
 
 
 @dataclass
 class FeeConfig:
-    """交易费用配置"""
+    """
+    交易费用配置（仅回测引擎使用）
+
+    实时监控的简化费率参数见 TradingConfig.etf_fee_rate / option_round_trip_fee。
+    """
     option_commission_per_contract: float = 1.7   # 期权每张手续费（元）
     option_commission_rate: float = 0.0            # 期权按比例手续费（备用）
     etf_commission_rate: float = 0.00006           # ETF 佣金费率（万0.6）
@@ -25,7 +28,11 @@ class FeeConfig:
 
 @dataclass
 class SlippageConfig:
-    """滑点配置"""
+    """
+    滑点配置（仅回测引擎使用）
+
+    实时监控使用严格 Bid/Ask 吃单价格，不额外计算滑点。
+    """
     option_slippage_ticks: int = 1                 # 期权滑点（最小变动单位数）
     etf_slippage_ticks: int = 1                    # ETF 滑点
     option_tick_size: float = 0.0001               # 期权最小变动价位
@@ -83,13 +90,20 @@ class TradingConfig:
     min_volume_threshold: int = 10                 # 最小成交量过滤
     enable_reverse: bool = False                   # 是否输出反向套利信号（融券卖出，未计息成本，默认关闭）
 
-    # PCP 套利成本参数（简化公式，见 pcp_arbitrage.py 说明）
+    # PCP 套利成本参数（实时监控简化公式，见 pcp_arbitrage.py 说明）
     etf_fee_rate: float = 0.00020                  # ETF 现货单边规费（含佣金+过户费，约万2）
-    option_round_trip_fee: float = 3.0             # 期权双边手续费（卖Call 1.7 + 买Put 1.3 ≈ 3 元/张）
+    option_round_trip_fee: float = 3.0             # 期权双边固定手续费（≈ fee.option_commission_per_contract × 2 取整）
 
     # ETF 模拟器参数
     simulation_volatility: float = 0.20            # 模拟波动率
     simulation_drift: float = 0.03                 # 模拟漂移率
+
+    def __post_init__(self) -> None:
+        assert self.contract_unit > 0, "contract_unit must be positive"
+        assert 0 <= self.etf_fee_rate < 0.01, f"etf_fee_rate={self.etf_fee_rate} out of range [0, 0.01)"
+        assert self.option_round_trip_fee >= 0, "option_round_trip_fee must be non-negative"
+        assert self.min_profit_threshold >= 0, "min_profit_threshold must be non-negative"
+        assert self.initial_capital > 0, "initial_capital must be positive"
 
 
 @dataclass
@@ -99,8 +113,7 @@ class RecorderConfig:
 
     控制 Wind 订阅品种、存储路径、分片写入间隔、ZMQ 发布端口等。
     """
-    # 监控品种（不含科创板两个品种）
-    products: list = field(default_factory=lambda: [
+    products: List[str] = field(default_factory=lambda: [
         "510050.SH",   # 50ETF
         "510300.SH",   # 300ETF（华泰）
         "510500.SH",   # 500ETF（南方）
@@ -111,7 +124,7 @@ class RecorderConfig:
     etf_fields: str    = "rt_last,rt_ask1,rt_bid1"
 
     # 存储路径
-    output_dir: str = r"D:\MARKET_DATA"
+    output_dir: str = "./market_data"
 
     # ZeroMQ 发布端口
     zmq_port: int = 5555

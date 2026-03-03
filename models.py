@@ -282,10 +282,6 @@ class AccountState:
         """账户权益 = 现金 + 未实现盈亏"""
         return self.cash + self.unrealized_pnl
 
-    @property
-    def net_asset_value(self) -> float:
-        """净资产 = 权益 - 保证金占用（可用资金）"""
-        return self.equity - self.total_margin
 
 
 # ============================================================

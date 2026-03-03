@@ -27,6 +27,8 @@ from models import (
 
 logger = logging.getLogger(__name__)
 
+_SORTED_UNDERLYING_KEYS = sorted(UNDERLYING_MAP.keys(), key=len, reverse=True)
+
 
 class ContractInfoManager:
     """
@@ -294,8 +296,7 @@ class ContractInfoManager:
         Raises:
             ValueError: 无法识别的标的类型
         """
-        sorted_keys = sorted(UNDERLYING_MAP.keys(), key=len, reverse=True)
-        for prefix in sorted_keys:
+        for prefix in _SORTED_UNDERLYING_KEYS:
             if prefix in short_name:
                 return UNDERLYING_MAP[prefix]
 

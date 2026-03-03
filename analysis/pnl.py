@@ -137,18 +137,19 @@ class PnLAnalyzer:
         signals: List[TradeSignal],
     ) -> GreeksAttribution:
         """
-        希腊字母盈亏归因（骨架实现）
+        希腊字母盈亏归因（骨架实现，结果仅供参考）
 
-        将总 P&L 分解为 Delta / Gamma / Theta / Vega 贡献。
-        完整实现需要逐 Tick 的 Greeks 快照数据，此处提供框架。
+        将总 P&L 按固定比例粗略拆分为 Delta / Gamma / Theta / Vega。
+        完整实现需要逐 Tick 的 Greeks 快照数据。
 
         Args:
             trade_history: 成交记录
             signals: 信号列表
 
         Returns:
-            GreeksAttribution 归因结果
+            GreeksAttribution 归因结果（近似值）
         """
+        logger.warning("Greeks 归因为骨架实现，比例为固定估算值，仅供参考")
         total_pnl = sum(
             (t.price * t.quantity * (1 if t.side == OrderSide.SELL else -1))
             for t in trade_history
@@ -323,13 +324,32 @@ class PnLAnalyzer:
         signals: List[TradeSignal],
         trade_history: List[TradeRecord],
     ) -> List[float]:
-        """估算每个信号的盈亏"""
+        """
+        计算每个信号的实际盈亏。
+
+        优先使用 trade_history 中的实际成交记录（按 signal_id 匹配），
+        若无匹配的成交记录则回退到预估值。
+        """
         if not signals:
             return []
 
+        trades_by_signal: Dict[int, List[TradeRecord]] = {}
+        for t in trade_history:
+            if t.signal_id is not None:
+                trades_by_signal.setdefault(t.signal_id, []).append(t)
+
         pnls: List[float] = []
-        for signal in signals:
-            pnls.append(signal.net_profit_estimate)
+        for i, signal in enumerate(signals):
+            legs = trades_by_signal.get(i)
+            if not legs:
+                pnls.append(signal.net_profit_estimate)
+                continue
+            total_cost = sum(
+                (t.price * t.quantity * (1 if t.side == OrderSide.BUY else -1))
+                + t.commission + t.slippage_cost
+                for t in legs
+            )
+            pnls.append(-total_cost)
         return pnls
 
     @staticmethod

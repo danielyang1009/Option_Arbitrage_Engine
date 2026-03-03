@@ -16,7 +16,6 @@ from __future__ import annotations
 import argparse
 import logging
 import sys
-import time
 from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
@@ -251,49 +250,6 @@ def run_backtest(
             )
 
 
-def run_monitor(config: TradingConfig) -> None:
-    """
-    执行实盘监控模式
-
-    连接 Wind 实时行情，持续扫描 PCP 套利机会并输出警报。
-
-    Args:
-        config: 交易配置
-    """
-    from data_engine.wind_adapter import WindAdapter
-    from data_engine.contract_info import ContractInfoManager
-    from strategies.pcp_arbitrage import PCPArbitrage
-
-    logger.info("=" * 60)
-    logger.info("启动实盘监控模式")
-    logger.info("=" * 60)
-
-    # 加载合约信息
-    contract_mgr = ContractInfoManager()
-    csv_path = Path(config.data_paths["contract_info_csv"])
-    if csv_path.exists():
-        contract_mgr.load_from_csv(csv_path)
-
-    # 连接 Wind
-    wind = WindAdapter(timeout=config.wind_timeout)
-    if not wind.connect():
-        logger.error("Wind 连接失败，退出监控模式")
-        return
-
-    strategy = PCPArbitrage(config)
-
-    logger.info("实盘监控已启动，按 Ctrl+C 退出...")
-    logger.info("监控阈值: 最小利润 %.0f 元/组", config.min_profit_threshold)
-
-    try:
-        while True:
-            time.sleep(1)
-    except KeyboardInterrupt:
-        logger.info("监控已停止")
-    finally:
-        wind.disconnect()
-
-
 def parse_args() -> argparse.Namespace:
     """解析命令行参数"""
     parser = argparse.ArgumentParser(
@@ -378,8 +334,9 @@ def main() -> None:
             output_chart=args.output_chart,
         )
     elif args.mode == "monitor":
-        config.wind_enabled = True
-        run_monitor(config)
+        print("实盘监控已迁移，请使用独立入口：")
+        print("  终端版: python term_monitor.py --source wind")
+        print("  网页版: python web_monitor.py")
 
 
 if __name__ == "__main__":

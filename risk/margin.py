@@ -176,8 +176,6 @@ class MarginCalculator:
             if pos.quantity >= 0:
                 continue
 
-            from data_engine.contract_info import ContractInfoManager
-            # 此处为骨架：实际使用中需传入 ContractInfoManager 实例
             logger.debug(
                 "计算合约 %s 的保证金（持仓 %d 张）",
                 pos.contract_code, pos.quantity,

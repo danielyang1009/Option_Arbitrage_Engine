@@ -24,7 +24,6 @@ from models import (
     ETFTickData,
     OptionType,
     TickData,
-    normalize_code,
 )
 
 logger = logging.getLogger(__name__)
@@ -43,6 +42,8 @@ class ETFSimulator:
         drift: 模拟年化漂移率
         risk_free_rate: 无风险利率
     """
+
+    _SECONDS_PER_YEAR = 252 * 6.5 * 3600
 
     def __init__(
         self,
@@ -64,6 +65,15 @@ class ETFSimulator:
         self.drift = drift
         self.risk_free_rate = risk_free_rate
         self._rng = np.random.default_rng(seed)
+
+    def _step_gbm(self, price: float, dt_seconds: float) -> float:
+        """单步 GBM：S(t+dt) = S(t) * exp((μ - σ²/2)dt + σ√dt·Z)"""
+        dt_years = max(dt_seconds / self._SECONDS_PER_YEAR, 1e-10)
+        z = self._rng.standard_normal()
+        return price * math.exp(
+            (self.drift - 0.5 * self.volatility ** 2) * dt_years
+            + self.volatility * math.sqrt(dt_years) * z
+        )
 
     def simulate_from_option_ticks(
         self,
@@ -144,7 +154,6 @@ class ETFSimulator:
 
         result: List[ETFTickData] = []
         price = initial_price
-        seconds_per_year = 252 * 6.5 * 3600  # 交易日 * 交易时段
 
         for i, ts in enumerate(timestamps):
             if i == 0:
@@ -154,14 +163,7 @@ class ETFSimulator:
                 continue
 
             dt_seconds = (ts - timestamps[i - 1]).total_seconds()
-            dt_years = max(dt_seconds / seconds_per_year, 1e-10)
-
-            z = self._rng.standard_normal()
-            price = price * math.exp(
-                (self.drift - 0.5 * self.volatility ** 2) * dt_years
-                + self.volatility * math.sqrt(dt_years) * z
-            )
-            price = round(max(price, 0.001), 4)
+            price = round(max(self._step_gbm(price, dt_seconds), 0.001), 4)
 
             spread_half = price * 0.0005
             result.append(ETFTickData(
@@ -205,12 +207,8 @@ class ETFSimulator:
             logger.info("未找到 Call/Put 配对，无法计算隐含价格锚点")
             return {}
 
-        latest_quotes: Dict[str, TickData] = {}
-        for code, ticks in option_ticks.items():
-            for tick in ticks:
-                latest_quotes[code] = tick
-
         anchors: Dict[datetime, List[float]] = defaultdict(list)
+        latest_quotes: Dict[str, TickData] = {}
 
         tick_index: Dict[str, int] = {code: 0 for code in option_ticks}
 
@@ -270,29 +268,19 @@ class ETFSimulator:
         """
         sorted_anchor_times = sorted(anchors.keys())
         result: List[ETFTickData] = []
-        seconds_per_year = 252 * 6.5 * 3600
 
         price = initial_price
-        last_anchor_price: Optional[float] = None
         anchor_idx = 0
 
         for i, ts in enumerate(all_timestamps):
             if ts in anchors:
                 price = anchors[ts]
-                last_anchor_price = price
                 while anchor_idx < len(sorted_anchor_times) and sorted_anchor_times[anchor_idx] <= ts:
                     anchor_idx += 1
             else:
                 if i > 0:
                     dt_seconds = (ts - all_timestamps[i - 1]).total_seconds()
-                    dt_years = max(dt_seconds / seconds_per_year, 1e-10)
-
-                    z = self._rng.standard_normal()
-                    price = price * math.exp(
-                        (self.drift - 0.5 * self.volatility ** 2) * dt_years
-                        + self.volatility * math.sqrt(dt_years) * z
-                    )
-                    price = max(price, 0.001)
+                    price = max(self._step_gbm(price, dt_seconds), 0.001)
 
             price = round(price, 4)
             spread_half = price * 0.0005

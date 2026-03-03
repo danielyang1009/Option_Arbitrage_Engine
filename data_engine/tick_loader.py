@@ -303,7 +303,7 @@ class TickLoader:
             # YYYYMMDDHHMMSSmmm
             years   = (numerics // 10_000_000_000_000).astype(np.int32)
             months  = ((numerics // 100_000_000_000) % 100).clip(1, 12).astype(np.int32)
-            days    = ((numerics // 1_000_000_000) % 100).clip(1, 28).astype(np.int32)
+            days    = ((numerics // 1_000_000_000) % 100).clip(1, 31).astype(np.int32)
             hours   = ((numerics // 10_000_000) % 100).astype(np.int32)
             minutes = ((numerics // 100_000) % 100).astype(np.int32)
             seconds = ((numerics // 1_000) % 100).astype(np.int32)
@@ -312,7 +312,7 @@ class TickLoader:
             # YYYYMMDDHHMMSS
             years   = (numerics // 10_000_000_000).astype(np.int32)
             months  = ((numerics // 100_000_000) % 100).clip(1, 12).astype(np.int32)
-            days    = ((numerics // 1_000_000) % 100).clip(1, 28).astype(np.int32)
+            days    = ((numerics // 1_000_000) % 100).clip(1, 31).astype(np.int32)
             hours   = ((numerics // 10_000) % 100).astype(np.int32)
             minutes = ((numerics // 100) % 100).astype(np.int32)
             seconds = (numerics % 100).astype(np.int32)
