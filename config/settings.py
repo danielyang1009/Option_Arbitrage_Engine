@@ -77,8 +77,8 @@ class TradingConfig:
     # 数据路径
     data_paths: Dict[str, str] = field(default_factory=lambda: {
         "sample_data": "sample_data",
-        "info_data": "info_data",
-        "contract_info_csv": "info_data/上交所期权基本信息.csv",
+        "info_data": "metadata",
+        "contract_info_csv": "metadata/上交所期权基本信息.csv",
     })
 
     # Wind 连接（实盘模式）

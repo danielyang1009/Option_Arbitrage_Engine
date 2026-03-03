@@ -147,7 +147,7 @@ class ContractInfo:
     """
     期权合约基本信息
 
-    数据来源：info_data/上交所期权基本信息.csv
+    数据来源：metadata/上交所期权基本信息.csv
     缺失字段（如合约单位）使用市场默认值。
     """
     contract_code: str          # 标准化代码（.SH 后缀），如 10000001.SH

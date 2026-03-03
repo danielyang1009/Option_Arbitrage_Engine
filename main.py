@@ -1,5 +1,5 @@
 """
-ETF 期权 PCP 套利回测与交易预警框架 -- 统一入口
+DeltaZero — ETF 期权 PCP 套利回测与交易预警框架
 
 支持两种运行模式：
 1. 回测模式（默认）：加载历史 Tick 数据 -> 生成信号 -> 执行回测 -> 输出分析报告
@@ -43,20 +43,25 @@ def run_backtest(
     start_month: Optional[str] = None,
     end_month: Optional[str] = None,
     output_chart: Optional[str] = None,
+    etf_data_dir: Optional[str] = None,
+    bar_mode: str = "close",
 ) -> None:
     """
     执行回测模式的完整流程
 
-    流程：加载数据 -> 加载合约信息 -> 模拟 ETF -> 扫描信号 -> 执行回测 -> 输出报告
+    流程：加载数据 -> 加载合约信息 -> ETF 价格（真实K线/模拟）-> 扫描信号 -> 执行回测 -> 输出报告
 
     Args:
         config: 交易配置
-        data_dir: Tick 数据目录
+        data_dir: 期权 Tick 数据目录
         start_month: 起始月份，格式 'YYYY-MM'（含），如 '2024-01'
         end_month: 结束月份，格式 'YYYY-MM'（含），如 '2024-06'
         output_chart: 权益曲线图保存路径（不传则不绘图）
+        etf_data_dir: ETF K 线数据目录（不传则使用 GBM 模拟）
+        bar_mode: K 线展开模式 "close" 或 "ohlc"
     """
     from data_engine.tick_loader import TickLoader
+    from data_engine.bar_loader import BarDataLoader
     from data_engine.contract_info import ContractInfoManager
     from data_engine.etf_simulator import ETFSimulator
     from strategies.pcp_arbitrage import PCPArbitrage
@@ -136,40 +141,69 @@ def run_backtest(
 
     logger.info("找到 %d 组 Call/Put 配对（有 Tick 数据）", len(all_pairs))
 
-    # ========== 4. 模拟 ETF 价格 ==========
+    # ========== 4. ETF 数据（真实 K 线 或 GBM 模拟）==========
     logger.info("=" * 60)
-    logger.info("Step 4: 模拟标的 ETF 价格")
-    logger.info("=" * 60)
-
-    simulator = ETFSimulator(
-        volatility=config.simulation_volatility,
-        drift=config.simulation_drift,
-        risk_free_rate=config.risk_free_rate,
-        seed=42,
-    )
 
     etf_ticks_map: Dict[str, List[ETFTickData]] = {}
-    for underlying in underlying_codes:
-        related_contracts = {
-            code: info for code, info in contracts.items()
-            if info.underlying_code == underlying
-        }
-        related_ticks = {
-            code: ticks for code, ticks in option_ticks.items()
-            if code in related_contracts
-        }
 
-        # 估算初始价格（从行权价推断）
-        strike_prices = [info.strike_price for info in related_contracts.values()]
-        initial_price = sum(strike_prices) / len(strike_prices) if strike_prices else 3.0
+    if etf_data_dir and Path(etf_data_dir).is_dir():
+        logger.info("Step 4: 加载真实 ETF K 线数据 (%s)", etf_data_dir)
+        logger.info("  展开模式: %s", bar_mode)
 
-        etf_data = simulator.simulate_from_option_ticks(
-            related_ticks, related_contracts, underlying, initial_price,
+        bar_loader = BarDataLoader(mode=bar_mode)
+        etf_ticks_map = bar_loader.load_directory(
+            etf_data_dir,
+            pattern="*.csv",
+            start_date=start_month,
+            end_date=end_month,
         )
-        etf_ticks_map[underlying] = etf_data
-        logger.info("  %s: 模拟 %d 条 ETF Tick（初始价格 ≈ %.4f）", underlying, len(etf_data), initial_price)
 
-    # 合并所有 ETF Tick
+        pq_ticks = bar_loader.load_directory(
+            etf_data_dir,
+            pattern="*.parquet",
+            start_date=start_month,
+            end_date=end_month,
+        )
+        for code, ticks in pq_ticks.items():
+            etf_ticks_map.setdefault(code, []).extend(ticks)
+
+        missing_etf = underlying_codes - set(etf_ticks_map.keys())
+        if missing_etf:
+            logger.warning("以下标的无 K 线数据，将使用 GBM 模拟: %s", missing_etf)
+    else:
+        if etf_data_dir:
+            logger.warning("ETF 数据目录不存在: %s，将使用 GBM 模拟", etf_data_dir)
+        logger.info("Step 4: 模拟标的 ETF 价格 (GBM)")
+
+    if missing_etf := (underlying_codes - set(etf_ticks_map.keys())):
+        simulator = ETFSimulator(
+            volatility=config.simulation_volatility,
+            drift=config.simulation_drift,
+            risk_free_rate=config.risk_free_rate,
+            seed=42,
+        )
+        for underlying in missing:
+            related_contracts = {
+                code: info for code, info in contracts.items()
+                if info.underlying_code == underlying
+            }
+            related_ticks = {
+                code: ticks for code, ticks in option_ticks.items()
+                if code in related_contracts
+            }
+            strike_prices = [info.strike_price for info in related_contracts.values()]
+            initial_price = sum(strike_prices) / len(strike_prices) if strike_prices else 3.0
+
+            etf_data = simulator.simulate_from_option_ticks(
+                related_ticks, related_contracts, underlying, initial_price,
+            )
+            etf_ticks_map[underlying] = etf_data
+            logger.info("  %s: GBM 模拟 %d 条 ETF Tick（初始价 ≈ %.4f）",
+                        underlying, len(etf_data), initial_price)
+
+    for code, ticks in etf_ticks_map.items():
+        logger.info("  %s: %d 条 ETF 事件", code, len(ticks))
+
     all_etf_ticks: List[ETFTickData] = []
     for ticks in etf_ticks_map.values():
         all_etf_ticks.extend(ticks)
@@ -234,7 +268,7 @@ def run_backtest(
     if output_chart and results["equity_curve"]:
         analyzer.plot_equity_curve(
             results["equity_curve"],
-            title="PCP 套利回测 - 权益曲线",
+            title="DeltaZero — PCP 套利回测 权益曲线",
             save_path=output_chart,
         )
 
@@ -253,7 +287,7 @@ def run_backtest(
 def parse_args() -> argparse.Namespace:
     """解析命令行参数"""
     parser = argparse.ArgumentParser(
-        description="ETF 期权 PCP 套利回测与交易预警框架",
+        description="DeltaZero — ETF 期权 PCP 套利回测与交易预警框架",
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     parser.add_argument(
@@ -297,6 +331,17 @@ def parse_args() -> argparse.Namespace:
         help="权益曲线图保存路径（如 output/equity.png）",
     )
     parser.add_argument(
+        "--etf-data-dir",
+        default=None,
+        help="ETF K 线数据目录（CSV/Parquet），不传则使用 GBM 模拟",
+    )
+    parser.add_argument(
+        "--bar-mode",
+        choices=["close", "ohlc"],
+        default="close",
+        help="K 线展开模式: close (仅收盘价，默认) 或 ohlc (四价路径模拟)",
+    )
+    parser.add_argument(
         "--verbose",
         action="store_true",
         help="输出详细日志",
@@ -315,7 +360,7 @@ def main() -> None:
     config.initial_capital = args.capital
     config.min_profit_threshold = args.min_profit
 
-    logger.info("ETF 期权 PCP 套利框架 v0.1")
+    logger.info("DeltaZero v0.1")
     logger.info("运行模式: %s", args.mode)
     logger.info("初始资金: {:,.0f} 元".format(config.initial_capital))
 
@@ -332,11 +377,13 @@ def main() -> None:
             start_month=args.start_date,
             end_month=args.end_date,
             output_chart=args.output_chart,
+            etf_data_dir=args.etf_data_dir,
+            bar_mode=args.bar_mode,
         )
     elif args.mode == "monitor":
         print("实盘监控已迁移，请使用独立入口：")
-        print("  终端版: python term_monitor.py --source wind")
-        print("  网页版: python web_monitor.py")
+        print("  终端版: python -m monitors.term_monitor --source wind")
+        print("  网页版: python -m monitors.web_monitor")
 
 
 if __name__ == "__main__":

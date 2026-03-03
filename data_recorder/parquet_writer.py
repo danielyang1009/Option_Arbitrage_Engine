@@ -8,6 +8,11 @@ Parquet 分片写入器
   - 崩溃最多丢失最近 flush_interval_secs 秒的数据
   - 每次刷新同步更新 snapshot_latest.parquet（每个合约只保留最新一条）
 
+关于 15:00 后仍产生分片的原因：
+  Wind wsq Push 在收盘后仍会推送 tick（如收盘价、心跳等），recorder 不做交易时间过滤，
+  所有接收到的数据都会写入。因此 15:10 合并后，若 recorder 继续运行，会持续产生新分片。
+  日终合并时会过滤掉非交易时间（9:30-11:30、13:00-15:00）的 tick。
+
 目录结构：
     {output_dir}/
     ├── chunks/
@@ -223,6 +228,9 @@ class ParquetWriter:
         """
         合并当日所有分片为两个日文件：options_YYYYMMDD.parquet 和 etf_YYYYMMDD.parquet。
         合并成功后删除分片文件。
+
+        仅保留交易时间内的 tick：上交所 9:30-11:30、13:00-15:00。
+        Wind 在盘前/盘后仍会推送数据，合并时过滤掉这些无效 tick。
         """
         if target_date is None:
             target_date = date.today()
@@ -238,6 +246,8 @@ class ParquetWriter:
 
             try:
                 import pyarrow.parquet as pq
+                import pandas as pd
+
                 tables = [pq.read_table(str(c)) for c in chunks]
                 import pyarrow as pa
                 merged = pa.concat_tables(tables)
@@ -245,11 +255,34 @@ class ParquetWriter:
                 import pyarrow.compute as pc
                 idx = pc.sort_indices(merged, sort_keys=[("ts", "ascending")])
                 merged = merged.take(idx)
+                original_count = merged.num_rows
+
+                # 过滤：仅保留交易时间 9:30-11:30、13:00-15:00
+                if original_count > 0 and "ts" in merged.column_names:
+                    df = merged.to_pandas()
+                    df["_dt"] = pd.to_datetime(df["ts"], unit="ms")
+                    df["_dt"] = df["_dt"].dt.tz_localize(None)
+                    df["_h"] = df["_dt"].dt.hour
+                    df["_m"] = df["_dt"].dt.minute
+                    df["_date_ok"] = df["_dt"].dt.date == target_date
+                    mask = df["_date_ok"] & (
+                        ((df["_h"] == 9) & (df["_m"] >= 30))
+                        | ((df["_h"] == 10))
+                        | ((df["_h"] == 11) & (df["_m"] <= 30))
+                        | ((df["_h"] == 13))
+                        | ((df["_h"] == 14))
+                        | ((df["_h"] == 15) & (df["_m"] == 0))
+                    )
+                    df = df[mask].drop(columns=["_dt", "_h", "_m", "_date_ok"])
+                    merged = pa.Table.from_pandas(df, preserve_index=False)
+                    n_dropped = original_count - merged.num_rows
+                    if n_dropped > 0:
+                        logger.info("过滤非交易时间 tick: %d 条", n_dropped)
 
                 out_path = self._root / f"{prefix}_{date_str}.parquet"
                 pq.write_table(merged, str(out_path), compression="snappy")
                 logger.info("日终合并完成：%s (%d 行，%d 个分片)",
-                            out_path.name, len(merged), len(chunks))
+                            out_path.name, merged.num_rows, len(chunks))
 
                 # 删除分片
                 for c in chunks:

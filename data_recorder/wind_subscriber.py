@@ -33,7 +33,7 @@ logger = logging.getLogger(__name__)
 OPTION_FIELDS = "rt_last,rt_ask1,rt_bid1,rt_oi,rt_vol,rt_high,rt_low"
 ETF_FIELDS    = "rt_last,rt_ask1,rt_bid1"
 
-CONTRACT_INFO_CSV = Path(__file__).parent.parent / "info_data" / "上交所期权基本信息.csv"
+CONTRACT_INFO_CSV = Path(__file__).parent.parent / "metadata" / "上交所期权基本信息.csv"
 
 
 # ──────────────────────────────────────────────────────────────────────

@@ -79,7 +79,9 @@ ETF_ORDER: List[str] = ["510050.SH", "510300.SH", "510500.SH"]
 
 MONITOR_UNDERLYINGS = {"510050.SH", "510300.SH", "510500.SH"}
 
-CONTRACT_INFO_CSV: Path = Path(__file__).parent / "info_data" / "上交所期权基本信息.csv"
+PROJECT_ROOT: Path = Path(__file__).resolve().parent.parent
+
+CONTRACT_INFO_CSV: Path = PROJECT_ROOT / "metadata" / "上交所期权基本信息.csv"
 
 
 # ══════════════════════════════════════════════════════════════════════
