@@ -9,17 +9,17 @@
 
 **项目名称**：DeltaZero
 **项目路径**：`d:\DeltaZero`
-**开发语言**：Python 3.10+（环境：`D:\veighna_studio`）
-**当前版本**：v0.5（monitors/ 包重构——消除 10+ 处重复逻辑 + bar_loader 新增）
+**开发语言**：Python 3.10+（Anaconda 环境）
+**当前版本**：v0.6（process_watcher + --new-window + merge 交易时间过滤）
 
-**四大组件**：
+**五大组件**：
 
 | 组件 | 入口文件 | 实现位置 | 状态 |
 |------|---------|---------|------|
-| 实时数据记录 | `data_recorder/recorder.py` | — | ✅ 已上线 |
-| 终端套利监控 | `term_monitor.py`（启动入口） | `monitors/term_monitor.py` | ✅ 已上线 |
-| 网页套利监控 | `web_monitor.py`（启动入口） | `monitors/web_monitor.py` | ✅ 已上线 |
+| 实时数据记录 | `recorder.py` 或 `data_recorder/recorder.py` | — | ✅ 已上线 |
+| 套利监控 | `monitor.py`（启动入口） | `monitors/monitor.py` | ✅ 已上线 |
 | 历史回测 | `main.py` | — | ✅ 可用（支持真实 ETF K 线） |
+| 进程看门狗 | `process_watcher.py` | — | ✅ 已上线 |
 
 ---
 
@@ -28,20 +28,19 @@
 ```
 d:\DeltaZero\
 │
-├── term_monitor.py          ★ 终端监控启动入口（转发到 monitors.term_monitor）
-├── web_monitor.py           ★ 网页监控启动入口（转发到 monitors.web_monitor）
+├── recorder.py              ★ 数据记录启动入口（转发到 data_recorder/recorder.py）
+├── monitor.py               ★ 套利监控启动入口（转发到 monitors.monitor）
+├── process_watcher.py       ★ 进程看门狗（recorder/monitor 状态 + --merge 合并分片）
 ├── main.py                    历史回测（--mode monitor 重定向到 monitors.*）
 ├── models.py                  全局数据模型
 ├── requirements.txt
 ├── README.md
 ├── STATE.md                   本文件
-├── REFACTOR_PLAN.md           重构蓝图（v0.4 审计基线）
 │
 ├── monitors/                ★ 监控包（v0.5 重构新增）
 │   ├── __init__.py            导出公共符号
 │   ├── common.py              共享逻辑（常量/合约加载/ZMQ解析/策略初始化）
-│   ├── term_monitor.py        终端监控完整实现（rich，Wind/ZMQ 双模式）
-│   └── web_monitor.py         网页监控完整实现（Flask + ZMQ 后台线程）
+│   └── monitor.py             套利监控完整实现（rich，Wind/ZMQ 双模式）
 │
 ├── config/
 │   └── settings.py            TradingConfig（含 etf_fee_rate / enable_reverse）+ RecorderConfig
@@ -49,11 +48,11 @@ d:\DeltaZero\
 ├── data_recorder/
 │   ├── recorder.py            主进程：队列消费 + Parquet + ZMQ
 │   ├── wind_subscriber.py     Wind wsq Push 回调（含乘数查询 + is_adjusted 标记）
-│   ├── parquet_writer.py      分片写入（schema 含 is_adjusted + multiplier）
+│   ├── parquet_writer.py      分片写入（merge 时仅保留交易时间 9:30-11:30、13:00-15:00）
 │   └── zmq_publisher.py       ZMQ PUB 广播
 │
 ├── data_engine/
-│   ├── contract_info.py       合约管理（load_multipliers_from_wind 动态乘数查询）
+│   ├── contract_info.py       合约管理（load_multipliers_from_optionchain 从当日 optionchain CSV 加载乘数）
 │   ├── tick_loader.py         CSV Tick 加载器（向量化）
 │   ├── bar_loader.py          K 线数据加载器（CSV/Parquet → ETFTickData，v0.5 新增）
 │   ├── wind_adapter.py        Wind API 适配器
@@ -68,21 +67,45 @@ d:\DeltaZero\
 ├── analysis/pnl.py            P&L 分析
 │
 ├── metadata/
-│   └── 上交所期权基本信息.csv  11,102 条合约
+│   ├── YYYY-MM-DD_optionchain.csv  当日期权链（fetch_optionchain 产出）
+│   ├── YYYY-MM-DD_optionchain.csv  当日期权链（含 multiplier，fetch_optionchain 产出）
+│   └── etf_option_info.md      品种上市时间参考
 │
 └── sample_data/               小样本数据
 ```
 
 **已删除**：
 - `monitor_common.py`（根目录，已被 `monitors/common.py` 取代）
+- `REFACTOR_PLAN.md`（重构蓝图已执行完毕）
 
 ---
 
-## 三、v0.5 核心变更（2026-03-03，monitors/ 包重构）
+## 三、v0.6 核心变更（2026-03-03）
 
-### 3.1 新建 `monitors/` 包，消除 10+ 处重复逻辑
+### 3.0 新增 process_watcher.py
 
-**背景**：v0.4 的 `term_monitor.py` 和 `web_monitor.py` 各自独立实现了相同业务逻辑（含细节差异），任何 bug 修复都需改两份，极易遗漏。
+- 监控 recorder / monitor 运行状态（psutil + snapshot）
+- `--merge` 模式：合并 chunks 分片，复用 ParquetWriter.merge_daily()
+- `--new-window`：在新 cmd 窗口启动（仅 Windows）
+- 依赖：psutil、requests
+
+### 3.1 recorder / monitor 支持 --new-window
+
+- 根目录入口（recorder.py / monitor.py）在解析参数前检测 `--new-window`，用 `subprocess.CREATE_NEW_CONSOLE` 弹窗启动
+- `data_recorder/recorder.py` 自身也支持 `--new-window`
+
+### 3.2 parquet_writer merge_daily 交易时间过滤
+
+- 合并时仅保留 9:30-11:30、13:00-15:00 的 tick
+- Wind 收盘后仍会推送，recorder 不过滤；merge 时过滤盘前/盘后数据
+
+---
+
+## 四、v0.5 核心变更（2026-03-03，monitors/ 包重构）
+
+### 4.1 新建 `monitors/` 包，消除 10+ 处重复逻辑
+
+**背景**：v0.4 的监控逻辑已统一到 `monitors/monitor.py`，共享逻辑在 `monitors/common.py`。
 
 **做法**：提取共享逻辑到 `monitors/common.py`，两个 monitor 改为从包内导入。
 
@@ -91,37 +114,36 @@ d:\DeltaZero\
 | 函数/常量 | 说明 |
 |----------|------|
 | `fix_windows_encoding()` | Windows UTF-8 修复（原两处各自实现） |
-| `ETF_NAME_MAP`, `ETF_ORDER`, `MONITOR_UNDERLYINGS`, `CONTRACT_INFO_CSV` | 常量统一（原两处重复） |
+| `ETF_NAME_MAP`, `ETF_ORDER`, `MONITOR_UNDERLYINGS` | 常量统一 |
 | `load_active_contracts()` | 活跃合约筛选（原两版实现不同，已统一） |
 | `build_pairs_and_codes()` | Call/Put 配对构建（原两版数据结构不同，已统一） |
 | `restore_from_snapshot()` | 快照恢复（原两版 ask_volumes 填充方式不同，已统一为 `[100]+[0]*4`） |
 | `parse_zmq_message()` | ZMQ 消息解析（原两版批次大小不同，已统一） |
-| `signal_to_dict()` | 信号序列化（web_monitor 专用，移入公共包） |
+| `signal_to_dict()` | 信号序列化（移入公共包） |
 | `init_strategy_and_contracts()` | 策略初始化完整流程封装 |
 
 **结果**：
-- 根目录 `term_monitor.py` / `web_monitor.py` 降级为轻量启动入口（转发脚本）
-- 业务逻辑完全统一，`monitors/term_monitor.py` 和 `monitors/web_monitor.py` 各自只保留 UI 渲染逻辑
+- 根目录 `monitor.py` 为轻量启动入口（转发脚本）
+- 业务逻辑在 `monitors/monitor.py`，共享逻辑在 `monitors/common.py`
 
-### 3.2 新增 `data_engine/bar_loader.py`
+### 4.2 新增 `data_engine/bar_loader.py`
 
 - 将 ETF K 线（CSV/Parquet）转换为 `ETFTickData` 列表，供 `BacktestEngine` 混合频率回测
 - 支持 `close` 模式（仅收盘价展开）和 `ohlc` 模式（四价路径模拟）
 - `main.py` 新增 `--etf-data-dir` 和 `--bar-mode` 参数，优先使用真实 K 线数据
 
-### 3.3 `main.py` 监控模式重定向
+### 4.3 `main.py` 监控模式重定向
 
 `--mode monitor` 不再包含空壳实现，改为打印提示并引导用户使用 `monitors.*` 包：
 
 ```
 实盘监控已迁移，请使用独立入口：
-  终端版: python -m monitors.term_monitor --source wind
-  网页版: python -m monitors.web_monitor
+  监控: python -m monitors.monitor --source wind
 ```
 
 ---
 
-## 四、v0.4 核心特性（历史记录）
+## 五、v0.4 核心特性（历史记录）
 
 v0.5 在此基础上重构，核心算法不变。
 
@@ -139,7 +161,7 @@ v0.5 在此基础上重构，核心算法不变。
 
 ### 动态合约乘数
 
-- `data_engine/contract_info.py` 的 `load_multipliers_from_wind(codes)` 批量查询真实乘数
+- `data_engine/contract_info.py` 的 `load_multipliers_from_optionchain(csv_path)` 从当日 `metadata/YYYY-MM-DD_optionchain.csv` 加载乘数（开盘前执行 `python fetch_optionchain.py`）
 - 标准合约 = 10000，50ETF 调整型当前 = 10265
 - `TradeSignal.multiplier` 传递到显示层
 
@@ -169,7 +191,7 @@ calc_detail: str = ""       # 人可读盘口公式，如 K(3.1)-S_a(3.09)+C_b(0
 
 ---
 
-## 五、数据资产
+## 六、数据资产
 
 ### 实时数据（data_recorder 产生）
 
@@ -194,28 +216,34 @@ D:\TICK_DATA\上交所\
 
 ### 合约信息
 
-`metadata/上交所期权基本信息.csv`（UTF-8-BOM，11,102 条）
+`metadata/YYYY-MM-DD_optionchain.csv`（fetch_optionchain 产出）
 字段：证券代码、证券简称、起始交易日期、最后交易日期、交割月份、行权价格、期权类型
 
 ---
 
-## 六、使用方法
+## 七、使用方法
 
 ```bash
 # 安装依赖
 pip install -r requirements.txt
 
 # 数据记录（交易时间全程运行）
-python data_recorder/recorder.py
+python recorder.py
+python recorder.py --new-window
 
 # 终端监控（直连 Wind，默认）
-python term_monitor.py --min-profit 50
+python monitor.py --min-profit 50
 
 # 终端监控（ZMQ 模式，需先启动 recorder）
-python term_monitor.py --source zmq --min-profit 100
+python monitor.py --source zmq --min-profit 100
 
 # 网页监控（ZMQ 模式，浏览器访问 http://localhost:8080）
-python web_monitor.py --min-profit 100
+
+# 进程看门狗（监控 recorder/monitor 状态）
+python process_watcher.py --new-window
+
+# 合并今日分片（过滤非交易时间）
+python process_watcher.py --merge
 
 # 历史回测（GBM 模拟 ETF）
 python main.py --data-dir "D:\TICK_DATA\上交所\华夏上证50ETF期权" --start-date 2024-01 --end-date 2024-01
@@ -228,7 +256,7 @@ python main.py --data-dir "D:\TICK_DATA\上交所\华夏上证50ETF期权" \
 
 ---
 
-## 七、已验证功能
+## 八、已验证功能
 
 | 功能 | 状态 | 备注 |
 |------|------|------|
@@ -237,8 +265,7 @@ python main.py --data-dir "D:\TICK_DATA\上交所\华夏上证50ETF期权" \
 | 严格 Bid/Ask 公式 | ✅ | 手算验证 net=-29.18(标准) / net=103.57(调整型) 完全一致 |
 | enable_reverse 过滤 | ✅ | False 时反向信号归零 |
 | monitors/ 包共享逻辑 | ✅ | load_active_contracts / restore_from_snapshot 等已统一 |
-| 终端监控 term_monitor | ✅ | Wind 直连 / ZMQ 双模式，分区显示 |
-| 网页监控 web_monitor | ✅ | Flask + JS 轮询，暗色主题 |
+| 套利监控 monitor | ✅ | Wind 直连 / ZMQ 双模式，分区显示 |
 | 数据记录 recorder | ✅ | Parquet 含 is_adjusted + multiplier |
 | ZMQ PUB/SUB | ✅ | 毫秒级广播，SUB 重连不影响 PUB |
 | 快照冷启动恢复 | ✅ | snapshot_latest.parquet → TickAligner |
@@ -247,10 +274,13 @@ python main.py --data-dir "D:\TICK_DATA\上交所\华夏上证50ETF期权" \
 | K 线数据加载（bar_loader） | ✅ | CSV/Parquet → ETFTickData，close/ohlc 两模式 |
 | Black-Scholes + IV | ✅ | ATM 验证通过 |
 | 回测引擎 | ✅ | Tick-by-Tick，支持真实 ETF K 线混合输入 |
+| 进程看门狗 | ✅ | recorder/monitor 双面板，--merge 合并分片 |
+| merge 交易时间过滤 | ✅ | 仅保留 9:30-11:30、13:00-15:00 |
+| --new-window | ✅ | monitor / process_watcher 支持 |
 
 ---
 
-## 八、已知问题与待办
+## 九、已知问题与待办
 
 ### 🔴 高优先级
 
@@ -280,15 +310,15 @@ python main.py --data-dir "D:\TICK_DATA\上交所\华夏上证50ETF期权" \
 10. 最大盘口价差过滤
 11. 声音/弹窗警报
 12. 多品种同时回测
-13. term_monitor Wind 模式单线程阻塞 — 数据拉取移到独立线程（参考 REFACTOR_PLAN.md Step 5）
+13. monitor Wind 模式单线程阻塞 — 数据拉取移到独立线程（参考 REFACTOR_PLAN.md Step 5）
 
 ---
 
-## 九、关键设计决策
+## 十、关键设计决策
 
 | 决策 | 选择 | 原因 |
 |------|------|------|
-| 合约乘数获取 | Wind wss 动态查询 | CSV 无乘数字段，Wind contractmultiplier 精确 |
+| 合约乘数获取 | optionchain CSV（fetch_optionchain 产出） | 开盘前 wset optionchain 抓取，含调整型真实乘数 |
 | 套利公式 | 严格 Bid/Ask + 无折现 | 接近到期 PV(K)≈K，吃单价格反映真实执行 |
 | 成本模型 | ETF规费万2 + 期权3元 | 简化且保守，避免过拟合 |
 | 调整型合约 | 不过滤，分区展示 | 用户需要全面信息，调整型可能有套利机会 |
@@ -297,14 +327,15 @@ python main.py --data-dir "D:\TICK_DATA\上交所\华夏上证50ETF期权" \
 | 数据持久化 | Parquet 30s 分片 | 崩溃安全，列式高压缩 |
 | 监控代码组织 | monitors/ 包 + 根目录启动入口 | 共享逻辑统一维护，命令行使用习惯不变 |
 | ETF 回测数据 | 优先真实 K 线，兜底 GBM | bar_loader 支持 CSV/Parquet，不传则自动 GBM |
+| merge 交易时间 | 仅保留 9:30-11:30、13:00-15:00 | Wind 收盘后仍推送，过滤盘前/盘后无效 tick |
 
 ---
 
-## 十、开发环境
+## 十一、开发环境
 
 ```
 OS: Windows 10/11
-Python: 3.10+（D:\veighna_studio 环境）
+Python: 3.10+（Anaconda 环境）
 WindPy: x64，C:\Wind\Wind.NET.Client\WindNET\x64\
 
 核心依赖（实测可用）:
@@ -313,26 +344,31 @@ WindPy: x64，C:\Wind\Wind.NET.Client\WindNET\x64\
   rich      >= 13.0
   pyzmq     26.3.0
   pyarrow   23.0.1
-  flask     >= 3.0
+  psutil    >= 5.9
 ```
 
 ---
 
-## 十一、继续开发建议
+## 十二、继续开发建议
 
 ```
-项目在 d:\DeltaZero，DeltaZero（v0.5）。
+项目在 d:\DeltaZero，DeltaZero（v0.6）。
 请先读取 STATE.md 了解全貌，再读取相关源码后开始修改。
 
 当前系统：
 - data_recorder/recorder.py：数据记录永续进程（Wind Push → Parquet + ZMQ）
-- term_monitor.py → monitors/term_monitor.py：终端监控（rich 表格，--source wind / --source zmq）
-- web_monitor.py → monitors/web_monitor.py：网页监控（Flask，localhost:8080）
+- monitor.py → monitors/monitor.py：套利监控（rich 表格，--source wind / --source zmq）
 - main.py：历史回测（--etf-data-dir 支持真实 ETF K 线）
-- monitors/common.py：两个 monitor 的共享逻辑（v0.5 新增）
+- monitors/common.py：monitor 的共享逻辑
+- process_watcher.py：进程看门狗 + --merge + --new-window
+
+v0.6 核心变更：
+- process_watcher.py 新增
+- monitor / process_watcher 支持 --new-window
+- parquet_writer merge_daily 仅保留交易时间 tick
 
 v0.5 核心变更：
-- monitors/ 包重构（消除 10+ 处 term/web monitor 重复逻辑）
+- monitors/ 包重构（共享逻辑统一到 common.py）
 - monitors/common.py 统一：load_active_contracts / build_pairs_and_codes /
   restore_from_snapshot / parse_zmq_message / init_strategy_and_contracts 等
 - data_engine/bar_loader.py 新增（ETF K 线 → ETFTickData）
@@ -345,7 +381,7 @@ v0.4 核心特性（不变）：
 - enable_reverse=False 默认关闭反向套利
 - TradeSignal 含 multiplier / is_adjusted / calc_detail 字段
 
-下一步重点（参考 REFACTOR_PLAN.md）：
+下一步重点：
 - Step 3：pcp_arbitrage.py 鲁棒性修复（signal_count / S_ask 回退 / Tick 新鲜度）
 - Step 7：backtest/engine.py 价格缓存 + pnl.py 实际 P&L 计算
 ```

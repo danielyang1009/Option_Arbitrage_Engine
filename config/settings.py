@@ -78,7 +78,6 @@ class TradingConfig:
     data_paths: Dict[str, str] = field(default_factory=lambda: {
         "sample_data": "sample_data",
         "info_data": "metadata",
-        "contract_info_csv": "metadata/上交所期权基本信息.csv",
     })
 
     # Wind 连接（实盘模式）
@@ -123,8 +122,8 @@ class RecorderConfig:
     option_fields: str = "rt_last,rt_ask1,rt_bid1,rt_oi,rt_vol,rt_high,rt_low"
     etf_fields: str    = "rt_last,rt_ask1,rt_bid1"
 
-    # 存储路径
-    output_dir: str = "./market_data"
+    # 存储路径（统一为 D:\MARKET_DATA）
+    output_dir: str = r"D:\MARKET_DATA"
 
     # ZeroMQ 发布端口
     zmq_port: int = 5555

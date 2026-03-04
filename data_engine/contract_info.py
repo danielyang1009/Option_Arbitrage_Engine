@@ -1,10 +1,7 @@
 """
 合约信息管理器
 
-双通道设计：
-1. 主通道：从 CSV 文件（metadata/上交所期权基本信息.csv）加载全量合约映射表
-2. Fallback：根据上交所编码规则和证券简称解析合约属性
-
+从当日 optionchain CSV（fetch_optionchain 产出）加载合约信息，含乘数。
 处理代码后缀标准化（.SH / .XSHG 互转）并提供 Call/Put 配对查询。
 """
 
@@ -13,7 +10,6 @@ from __future__ import annotations
 import csv
 import logging
 import re
-from collections import defaultdict
 from datetime import date, datetime
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
@@ -27,7 +23,22 @@ from models import (
 
 logger = logging.getLogger(__name__)
 
-_SORTED_UNDERLYING_KEYS = sorted(UNDERLYING_MAP.keys(), key=len, reverse=True)
+_ADJUSTED_TAIL_RE = re.compile(r"[A-Z]$")
+
+
+def get_optionchain_path(target_date: date | None = None, metadata_dir: Path | None = None) -> Path:
+    """
+    获取 optionchain CSV 路径。
+    若指定日期文件不存在，则返回 metadata 下最新一份。
+    """
+    base = metadata_dir or (Path(__file__).resolve().parent.parent / "metadata")
+    if target_date is None:
+        target_date = date.today()
+    p = base / f"{target_date:%Y-%m-%d}_optionchain.csv"
+    if p.exists():
+        return p
+    candidates = sorted(base.glob("*_optionchain.csv"), reverse=True)
+    return candidates[0] if candidates else p
 
 
 class ContractInfoManager:
@@ -45,15 +56,15 @@ class ContractInfoManager:
         self.contracts: Dict[str, ContractInfo] = {}
         self._pairs_cache: Dict[str, List[Tuple[ContractInfo, ContractInfo]]] = {}
 
-    def load_from_csv(self, filepath: str | Path) -> int:
+    def load_from_optionchain(self, csv_path: str | Path) -> int:
         """
-        从 CSV 文件加载合约基本信息
+        从 optionchain CSV（fetch_optionchain 产出）加载合约信息，含乘数。
 
-        CSV 格式要求（UTF-8/UTF-8-BOM 编码）：
-        证券代码,证券简称,起始交易日期,最后交易日期,交割月份,行权价格,期权类型
+        CSV 需含：option_code, option_name, us_code, strike_price, month, call_put,
+        first_tradedate, last_tradedate, multiplier。
 
         Args:
-            filepath: CSV 文件路径
+            csv_path: metadata/YYYY-MM-DD_optionchain.csv 路径
 
         Returns:
             成功加载的合约数量
@@ -61,23 +72,23 @@ class ContractInfoManager:
         Raises:
             FileNotFoundError: CSV 文件不存在
         """
-        filepath = Path(filepath)
-        if not filepath.exists():
-            raise FileNotFoundError(f"合约信息文件不存在: {filepath}")
+        csv_path = Path(csv_path)
+        if not csv_path.exists():
+            raise FileNotFoundError(f"optionchain 文件不存在: {csv_path}")
 
-        logger.info("加载合约信息: %s", filepath)
+        logger.info("加载合约信息: %s", csv_path)
         count = 0
 
-        with open(filepath, "r", encoding="utf-8-sig") as f:
+        with open(csv_path, "r", encoding="utf-8-sig") as f:
             reader = csv.DictReader(f)
             for row in reader:
                 try:
-                    info = self._parse_csv_row(row)
+                    info = self._parse_optionchain_row(row)
                     if info is not None:
                         self.contracts[info.contract_code] = info
                         count += 1
                 except Exception as e:
-                    logger.warning("解析合约行失败（跳过）: %s | 行内容: %s", e, row)
+                    logger.warning("解析 optionchain 行失败（跳过）: %s | 行: %s", e, row)
                     continue
 
         self._pairs_cache.clear()
@@ -163,51 +174,6 @@ class ContractInfoManager:
                 expiries.add(info.expiry_date)
         return sorted(expiries)
 
-    def load_multipliers_from_wind(self, codes: Optional[List[str]] = None, batch_size: int = 200) -> int:
-        """
-        通过 Wind wss 批量查询真实合约乘数，更新 contract_unit 字段。
-
-        Args:
-            codes: 要查询的合约代码列表；None 表示查所有已加载的合约
-            batch_size: 单批查询上限
-
-        Returns:
-            成功更新的合约数
-        """
-        try:
-            from WindPy import w
-        except ImportError:
-            logger.warning("WindPy 不可用，跳过乘数查询，全部使用默认值 10000")
-            return 0
-
-        if codes is None:
-            codes = list(self.contracts.keys())
-        if not codes:
-            return 0
-
-        updated = 0
-        for i in range(0, len(codes), batch_size):
-            batch = codes[i : i + batch_size]
-            result = w.wss(",".join(batch), "contractmultiplier")
-            if result is None or result.ErrorCode != 0:
-                logger.warning("Wind wss 查询乘数失败 (batch %d)", i // batch_size)
-                continue
-            for j, code in enumerate(result.Codes):
-                norm = normalize_code(code, ".SH")
-                info = self.contracts.get(norm)
-                if info is None:
-                    continue
-                try:
-                    mult = int(float(result.Data[0][j]))
-                    if mult > 0:
-                        info.contract_unit = mult
-                        updated += 1
-                except (TypeError, ValueError, IndexError):
-                    pass
-
-        logger.info("已从 Wind 更新 %d / %d 个合约的真实乘数", updated, len(codes))
-        return updated
-
     def get_contracts_by_underlying(self, underlying: str) -> List[ContractInfo]:
         """
         获取指定标的的所有合约
@@ -230,74 +196,70 @@ class ContractInfoManager:
             return UNDERLYING_MAP[underlying]
         return normalize_code(underlying, ".SH")
 
-    _ADJUSTED_TAIL_RE = re.compile(r"[A-Z]$")
-
-    def _parse_csv_row(self, row: Dict[str, str]) -> Optional[ContractInfo]:
+    def _parse_optionchain_row(self, row: dict) -> Optional[ContractInfo]:
         """
-        解析 CSV 中的一行数据为 ContractInfo
+        解析 optionchain CSV 的一行为 ContractInfo。
 
-        跳过空行（证券代码为空的行）。
-        自动识别调整型合约（ETF 分红后产生，名称末尾带 A/B/C 标记）。
+        自动识别调整型合约（option_name 末尾带 A/B/C 标记）。
         """
-        raw_code = row.get("证券代码", "").strip()
-        if not raw_code:
+        code = row.get("option_code") or row.get("wind_code") or ""
+        if not code:
             return None
 
-        short_name = row.get("证券简称", "").strip()
-        if not short_name:
+        short_name = (row.get("option_name") or "").strip()
+        us_code = normalize_code((row.get("us_code") or "").strip(), ".SH")
+        if not us_code:
             return None
 
-        contract_code = normalize_code(raw_code, ".SH")
-        option_type = self._parse_option_type(row.get("期权类型", ""))
-        underlying_code = self._infer_underlying(short_name)
-        strike_price = float(row["行权价格"])
-        list_date = datetime.strptime(row["起始交易日期"], "%Y-%m-%d").date()
-        expiry_date = datetime.strptime(row["最后交易日期"], "%Y-%m-%d").date()
-        delivery_month = row.get("交割月份", "").strip()
+        call_put = (row.get("call_put") or "").strip()
+        if call_put == "认购":
+            option_type = OptionType.CALL
+        elif call_put == "认沽":
+            option_type = OptionType.PUT
+        else:
+            return None
 
-        is_adjusted = bool(self._ADJUSTED_TAIL_RE.search(short_name))
+        try:
+            strike_price = float(row.get("strike_price", 0))
+        except (TypeError, ValueError):
+            return None
+
+        list_date = self._parse_date(row.get("first_tradedate"))
+        expiry_date = self._parse_date(row.get("last_tradedate"))
+        if list_date is None or expiry_date is None:
+            return None
+
+        delivery_month = str(row.get("month") or "").strip()
+
+        mult_raw = row.get("multiplier")
+        try:
+            contract_unit = int(float(mult_raw)) if mult_raw else 10000
+            if contract_unit <= 0:
+                contract_unit = 10000
+        except (TypeError, ValueError):
+            contract_unit = 10000
+
+        is_adjusted = bool(_ADJUSTED_TAIL_RE.search(short_name))
 
         return ContractInfo(
-            contract_code=contract_code,
+            contract_code=normalize_code(code, ".SH"),
             short_name=short_name,
-            underlying_code=underlying_code,
+            underlying_code=us_code,
             option_type=option_type,
             strike_price=strike_price,
             list_date=list_date,
             expiry_date=expiry_date,
             delivery_month=delivery_month,
             is_adjusted=is_adjusted,
+            contract_unit=contract_unit,
         )
 
     @staticmethod
-    def _parse_option_type(raw: str) -> OptionType:
-        """将中文期权类型转换为枚举"""
-        raw = raw.strip()
-        if raw == "认购":
-            return OptionType.CALL
-        elif raw == "认沽":
-            return OptionType.PUT
-        else:
-            raise ValueError(f"未知的期权类型: '{raw}'")
-
-    @staticmethod
-    def _infer_underlying(short_name: str) -> str:
-        """
-        从证券简称推断标的 ETF 代码
-
-        匹配规则按长度从长到短，避免 '50ETF' 错误匹配 '科创板50'。
-
-        Args:
-            short_name: 如 "50ETF购2015年3月2200"
-
-        Returns:
-            标的 ETF 代码，如 "510050.SH"
-
-        Raises:
-            ValueError: 无法识别的标的类型
-        """
-        for prefix in _SORTED_UNDERLYING_KEYS:
-            if prefix in short_name:
-                return UNDERLYING_MAP[prefix]
-
-        raise ValueError(f"无法从证券简称推断标的: '{short_name}'")
+    def _parse_date(s: str) -> Optional[date]:
+        """解析 YYYY-MM-DD 为 date"""
+        if not s:
+            return None
+        try:
+            return datetime.strptime(str(s).strip()[:10], "%Y-%m-%d").date()
+        except ValueError:
+            return None

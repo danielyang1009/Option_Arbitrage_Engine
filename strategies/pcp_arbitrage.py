@@ -131,6 +131,97 @@ class PCPArbitrage:
         """接收 ETF Tick 更新"""
         self.aligner.update_etf(tick)
 
+    def scan_pairs_for_display(
+        self,
+        call_put_pairs: List[Tuple[ContractInfo, ContractInfo]],
+        current_time: Optional[datetime] = None,
+    ) -> List[TradeSignal]:
+        """
+        为展示用：对所有有报价的配对计算正向利润（含负值），不按 min_profit_threshold 过滤。
+
+        每个配对始终返回一个 TradeSignal（signal_type=FORWARD），net_profit_estimate
+        为实际利润，可为负值。报价缺失的配对跳过。
+
+        调用方（monitor）负责按行权价相对平值筛选固定行数。
+        """
+        signals: List[TradeSignal] = []
+
+        for call_info, put_info in call_put_pairs:
+            sig = self._evaluate_pair_for_display(call_info, put_info, current_time)
+            if sig is not None:
+                signals.append(sig)
+
+        signals.sort(key=lambda s: s.strike)
+        return signals
+
+    def _evaluate_pair_for_display(
+        self,
+        call_info: ContractInfo,
+        put_info: ContractInfo,
+        current_time: Optional[datetime] = None,
+    ) -> Optional[TradeSignal]:
+        """计算配对的正向利润，始终返回 TradeSignal（不按阈值过滤），报价缺失则返回 None。"""
+        call_tick = self.aligner.get_option_quote(call_info.contract_code)
+        put_tick  = self.aligner.get_option_quote(put_info.contract_code)
+        underlying = call_info.underlying_code
+        etf_price  = self.aligner.get_etf_price(underlying)
+
+        if call_tick is None or put_tick is None or etf_price is None:
+            return None
+
+        if current_time is None:
+            current_time = max(call_tick.timestamp, put_tick.timestamp)
+
+        C_bid = call_tick.bid_prices[0]
+        C_ask = call_tick.ask_prices[0]
+        P_bid = put_tick.bid_prices[0]
+        P_ask = put_tick.ask_prices[0]
+
+        if any(math.isnan(p) for p in [C_bid, C_ask, P_bid, P_ask]):
+            return None
+        if any(p <= 0 for p in [C_bid, C_ask, P_bid, P_ask]):
+            return None
+
+        K    = call_info.strike_price
+        mult = call_info.contract_unit
+        T    = call_info.time_to_expiry(current_time.date())
+        r    = self.config.risk_free_rate
+
+        _s_ask = self.aligner.get_etf_ask(underlying)
+        S_ask = _s_ask if _s_ask is not None else etf_price
+
+        etf_fee_rate   = self.config.etf_fee_rate
+        option_rt_fee  = self.config.option_round_trip_fee
+
+        fwd_per_share = K - (S_ask + P_ask - C_bid)
+        fwd_etf_fee   = S_ask * mult * etf_fee_rate
+        fwd_profit    = fwd_per_share * mult - fwd_etf_fee - option_rt_fee
+        fwd_detail    = (
+            f"K({K:.3g})-S_a({S_ask:.4f})-P_a({P_ask:.4f})+C_b({C_bid:.4f})"
+            f"={fwd_per_share:.4f}/股"
+        )
+        theoretical_spread = etf_price - K * math.exp(-r * T)
+
+        return TradeSignal(
+            timestamp=current_time,
+            signal_type=SignalType.FORWARD,
+            call_code=call_info.contract_code,
+            put_code=put_info.contract_code,
+            underlying_code=underlying,
+            strike=K,
+            expiry=call_info.expiry_date,
+            call_ask=C_ask, call_bid=C_bid,
+            put_ask=P_ask,  put_bid=P_bid,
+            spot_price=etf_price,
+            theoretical_spread=theoretical_spread,
+            actual_spread=C_bid - P_ask,
+            net_profit_estimate=fwd_profit,
+            confidence=self._calc_confidence(fwd_profit, call_tick, put_tick),
+            multiplier=mult,
+            is_adjusted=call_info.is_adjusted,
+            calc_detail=fwd_detail,
+        )
+
     def scan_opportunities(
         self,
         call_put_pairs: List[Tuple[ContractInfo, ContractInfo]],

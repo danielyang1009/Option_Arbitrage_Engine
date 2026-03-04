@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-monitor_common — term_monitor / web_monitor 共享逻辑
+monitor_common — monitor 共享逻辑
 
 提供：
   - Windows 终端 UTF-8 编码修复
@@ -35,7 +35,7 @@ from models import (
     TradeSignal,
 )
 from config.settings import TradingConfig, get_default_config
-from data_engine.contract_info import ContractInfoManager
+from data_engine.contract_info import ContractInfoManager, get_optionchain_path
 from strategies.pcp_arbitrage import PCPArbitrage
 
 logger = logging.getLogger(__name__)
@@ -81,7 +81,6 @@ MONITOR_UNDERLYINGS = {"510050.SH", "510300.SH", "510500.SH"}
 
 PROJECT_ROOT: Path = Path(__file__).resolve().parent.parent
 
-CONTRACT_INFO_CSV: Path = PROJECT_ROOT / "metadata" / "上交所期权基本信息.csv"
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -304,7 +303,7 @@ def estimate_etf_fallback_prices(
 
 
 # ══════════════════════════════════════════════════════════════════════
-# 信号序列化（web_monitor / API 用）
+# 信号序列化
 # ══════════════════════════════════════════════════════════════════════
 
 def signal_to_dict(sig: TradeSignal) -> dict:
@@ -331,6 +330,36 @@ def signal_to_dict(sig: TradeSignal) -> dict:
 
 
 # ══════════════════════════════════════════════════════════════════════
+# 展示行筛选
+# ══════════════════════════════════════════════════════════════════════
+
+def select_display_pairs(
+    all_signals: List[TradeSignal],
+    etf_price: float,
+    n_each_side: int = 10,
+) -> List[TradeSignal]:
+    """
+    按行权价相对平值排序，取平值下方 n_each_side 个 + 平值上方 n_each_side 个。
+
+    all_signals 来自 scan_pairs_for_display，按 strike 升序排列。
+    返回结果按 (expiry, strike) 升序排列，总行数不超过 2 * n_each_side。
+
+    当某侧合约数量不足 n_each_side 时，返回该侧所有合约（不从另一侧补齐）。
+    """
+    below = [s for s in all_signals if s.strike <= etf_price]
+    above = [s for s in all_signals if s.strike > etf_price]
+
+    # below 取距平值最近的 n 个（即 strike 最大的 n 个）
+    below_sel = sorted(below, key=lambda s: s.strike, reverse=True)[:n_each_side]
+    # above 取距平值最近的 n 个（即 strike 最小的 n 个）
+    above_sel = sorted(above, key=lambda s: s.strike)[:n_each_side]
+
+    combined = below_sel + above_sel
+    combined.sort(key=lambda s: (s.expiry, s.strike))
+    return combined
+
+
+# ══════════════════════════════════════════════════════════════════════
 # 策略初始化便捷函数
 # ══════════════════════════════════════════════════════════════════════
 
@@ -340,7 +369,6 @@ def init_strategy_and_contracts(
     atm_range_pct: float,
     etf_prices: Dict[str, float],
     *,
-    query_wind_multipliers: bool = True,
     log_fn=None,
 ) -> Tuple[
     PCPArbitrage,
@@ -367,24 +395,18 @@ def init_strategy_and_contracts(
     strategy = PCPArbitrage(config)
 
     contract_mgr = ContractInfoManager()
-    if not CONTRACT_INFO_CSV.exists():
-        raise FileNotFoundError(f"合约信息文件不存在: {CONTRACT_INFO_CSV}")
-    n = contract_mgr.load_from_csv(CONTRACT_INFO_CSV)
-    _log(f"已加载 {n} 条合约信息")
+    optionchain_csv = get_optionchain_path()
+    if not optionchain_csv.exists():
+        raise FileNotFoundError(
+            f"optionchain 文件不存在: {optionchain_csv}，请开盘前执行 python fetch_optionchain.py"
+        )
+    n = contract_mgr.load_from_optionchain(optionchain_csv)
+    _log(f"已从 optionchain 加载 {n} 条合约信息")
 
     active = load_active_contracts(contract_mgr, expiry_days)
     if not active:
         raise RuntimeError("无活跃合约")
     _log(f"当前活跃合约（{expiry_days}天内到期）: {len(active)} 个")
-
-    if query_wind_multipliers:
-        try:
-            active_codes = [c.contract_code for c in active]
-            n_mult = contract_mgr.load_multipliers_from_wind(active_codes)
-            if n_mult > 0:
-                _log(f"已从 Wind 更新 {n_mult} 个合约的真实乘数")
-        except Exception:
-            _log("Wind 乘数查询跳过（可能未连接）")
 
     etf_codes = sorted(set(c.underlying_code for c in active))
     estimate_etf_fallback_prices(etf_prices, active, etf_codes)

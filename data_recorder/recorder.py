@@ -229,20 +229,39 @@ def _parse_args() -> argparse.Namespace:
   python data_recorder/recorder.py
   python data_recorder/recorder.py --flush 60 --output D:\\MARKET_DATA
   python data_recorder/recorder.py --port 5556
+  python data_recorder/recorder.py --new-window
         """,
     )
     parser.add_argument("--output", type=str, default=None,
-                        help="Parquet 存储目录（默认: D:\\MARKET_DATA）")
+                        help="Parquet 存储目录（默认 D:\\MARKET_DATA，可覆盖）")
     parser.add_argument("--port",  type=int, default=None,
                         help="ZMQ PUB 端口（默认: 5555）")
     parser.add_argument("--flush", type=int, default=None,
                         help="分片刷新间隔秒数（默认: 30）")
     parser.add_argument("--batch", type=int, default=None,
                         help="wsq 每批代码数（默认: 80）")
+    parser.add_argument("--new-window", action="store_true",
+                        help="在新终端窗口中启动（仅 Windows）")
     return parser.parse_args()
 
 
+def _relaunch_in_new_window() -> bool:
+    """若 sys.argv 含 --new-window，在新 cmd 窗口重启本脚本并退出。仅 Windows 有效。"""
+    if "--new-window" not in sys.argv:
+        return False
+    if sys.platform == "win32":
+        import subprocess
+        cmd = [sys.executable, str(Path(__file__).resolve())] + [
+            a for a in sys.argv[1:] if a != "--new-window"
+        ]
+        subprocess.Popen(cmd, creationflags=subprocess.CREATE_NEW_CONSOLE)
+    return True
+
+
 def main() -> None:
+    if _relaunch_in_new_window():
+        return
+
     args = _parse_args()
     config = get_recorder_config()
 

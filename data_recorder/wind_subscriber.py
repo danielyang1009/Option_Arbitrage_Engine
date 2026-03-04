@@ -25,7 +25,7 @@ from queue import Queue
 from typing import Callable, Dict, List, Optional, Tuple
 
 from models import ETFTickData, TickData, normalize_code
-from data_engine.contract_info import ContractInfoManager
+from data_engine.contract_info import ContractInfoManager, get_optionchain_path
 
 logger = logging.getLogger(__name__)
 
@@ -33,7 +33,6 @@ logger = logging.getLogger(__name__)
 OPTION_FIELDS = "rt_last,rt_ask1,rt_bid1,rt_oi,rt_vol,rt_high,rt_low"
 ETF_FIELDS    = "rt_last,rt_ask1,rt_bid1"
 
-CONTRACT_INFO_CSV = Path(__file__).parent.parent / "metadata" / "上交所期权基本信息.csv"
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -275,12 +274,13 @@ class WindSubscriber:
 
     def _load_contracts(self) -> None:
         """从 CSV 加载合约信息，筛选出目标品种的活跃合约"""
-        if not CONTRACT_INFO_CSV.exists():
-            logger.error("合约信息文件不存在: %s", CONTRACT_INFO_CSV)
+        optionchain_csv = get_optionchain_path(metadata_dir=Path(__file__).parent.parent / "metadata")
+        if not optionchain_csv.exists():
+            logger.error("optionchain 文件不存在: %s，请开盘前执行 python fetch_optionchain.py", optionchain_csv)
             return
 
         mgr = ContractInfoManager()
-        mgr.load_from_csv(CONTRACT_INFO_CSV)
+        mgr.load_from_optionchain(optionchain_csv)
 
         today = date.today()
         product_set = set(self._products)
@@ -300,15 +300,6 @@ class WindSubscriber:
             if info.is_adjusted:
                 self._code_is_adjusted.add(code)
                 n_adjusted += 1
-
-        # 通过 Wind 批量查询真实乘数
-        n_mult = mgr.load_multipliers_from_wind(self._option_codes)
-        if n_mult > 0:
-            for code in self._option_codes:
-                info = mgr.contracts.get(code)
-                if info:
-                    self._code_multiplier[code] = info.contract_unit
-            logger.info("已从 Wind 更新 %d 个合约的真实乘数", n_mult)
 
         logger.info(
             "活跃期权合约: %d 个（品种: %s，到期天数: ≤%d，其中调整型: %d 个）",

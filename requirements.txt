@@ -6,6 +6,4 @@ matplotlib>=3.7
 rich>=13.0        # monitor_live.py 终端彩色显示
 pyzmq>=25.0       # data_recorder ZMQ 行情广播
 pyarrow>=14.0     # data_recorder Parquet 分片写入与读取
-flask>=3.0        # web_monitor.py 网页版监控
 psutil>=5.9       # process_watcher.py 进程检测
-requests>=2.28    # process_watcher.py 查询 web_monitor API

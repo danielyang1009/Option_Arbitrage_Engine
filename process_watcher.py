@@ -97,31 +97,19 @@ def find_recorder_processes() -> List[psutil.Process]:
     result = []
     for p in psutil.process_iter(["pid", "cmdline", "create_time"]):
         cmd = _cmdline(p)
-        if "recorder.py" in cmd and "term_monitor" not in cmd and "web_monitor" not in cmd:
+        if "recorder.py" in cmd and "monitor" not in cmd:
             result.append(p)
     return result
 
 
-def find_term_monitor_processes() -> List[psutil.Process]:
+def find_monitor_processes() -> List[psutil.Process]:
+    """查找所有 monitor 进程。注意：若某进程 cmdline 因权限无法读取会返回空串，该进程会被漏检。"""
     result = []
     for p in psutil.process_iter(["pid", "cmdline", "create_time"]):
         cmd = _cmdline(p)
-        if "term_monitor" in cmd and "process_watcher" not in cmd:
+        cmd_lower = cmd.lower()
+        if "monitor" in cmd_lower and "process_watcher" not in cmd_lower:
             result.append(p)
-    return result
-
-
-def find_web_monitor_processes() -> List[Tuple[psutil.Process, int]]:
-    result = []
-    for p in psutil.process_iter(["pid", "cmdline", "create_time"]):
-        cmd = _cmdline(p)
-        if "web_monitor" in cmd and "process_watcher" not in cmd:
-            port_str = _arg_value(p, "--port", "8080")
-            try:
-                port = int(port_str)
-            except ValueError:
-                port = 8080
-            result.append((p, port))
     return result
 
 
@@ -190,21 +178,6 @@ def count_today_chunks(market_data_dir: str) -> Dict:
         "total_mb": total_bytes / (1024 * 1024),
         "latest_time": latest_time,
     }
-
-
-# ══════════════════════════════════════════════════════════════════════
-# Web Monitor API 查询
-# ══════════════════════════════════════════════════════════════════════
-
-def query_web_api(port: int) -> Optional[Dict]:
-    try:
-        import requests
-        resp = requests.get(f"http://localhost:{port}/api/signals", timeout=2)
-        if resp.status_code == 200:
-            return resp.json()
-    except Exception:
-        pass
-    return None
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -289,113 +262,55 @@ def build_recorder_panel(market_data_dir: str) -> Panel:
     return Panel(tbl, title="[bold]Recorder — 数据记录[/bold]", border_style=border)
 
 
-def build_term_monitor_panel() -> Panel:
-    procs = find_term_monitor_processes()
+# 数据来源 → 用途说明（wind 直连 Wind 获取行情，zmq 从 recorder 读 ZMQ）
+_SOURCE_LABELS: Dict[str, str] = {
+    "wind": "wind (直连 Wind 行情)",
+    "zmq": "zmq (读 recorder ZMQ)",
+}
+
+
+def build_monitor_panel() -> Panel:
+    procs = find_monitor_processes()
 
     if not procs:
         return Panel(
             Text("● 未运行", style="bold red"),
-            title="[bold]Term Monitor — 终端监控[/bold]",
+            title="[bold]Monitor — 进程监控[/bold]",
             border_style="red",
         )
+
+    # 按数据来源排序：wind 在前，zmq 在后
+    def _source_order(p: psutil.Process) -> int:
+        s = _arg_value(p, "--source", "wind").lower()
+        return 0 if s == "wind" else 1
+
+    procs = sorted(procs, key=_source_order)
 
     border = "bright_green" if len(procs) == 1 else "yellow"
 
     tbl = Table(box=box.SIMPLE, show_header=True, padding=(0, 1), expand=True)
     tbl.add_column("PID", style="dim", width=7)
-    tbl.add_column("数据来源", width=6)
+    tbl.add_column("数据来源", width=24)
     tbl.add_column("最小利润", width=8, justify="right")
     tbl.add_column("到期天数", width=8, justify="right")
     tbl.add_column("运行时长", width=8, justify="right")
 
     for proc in procs:
-        source = _arg_value(proc, "--source", "wind")
+        source_raw = _arg_value(proc, "--source", "wind").lower()
+        source_label = _SOURCE_LABELS.get(source_raw, f"{source_raw} (未知)")
         min_profit = _arg_value(proc, "--min-profit", "30")
         expiry_days = _arg_value(proc, "--expiry-days", "90")
         tbl.add_row(
             str(proc.pid),
-            f"[cyan]{source}[/cyan]",
+            f"[cyan]{source_label}[/cyan]",
             f"{min_profit} 元",
             f"{expiry_days} 天",
             _uptime(proc),
         )
 
-    renderables: list = [tbl]
-    if len(procs) > 1:
-        renderables.append(
-            Text.from_markup(f"\n[bold yellow]⚠ 当前有 {len(procs)} 个 term_monitor 实例同时运行[/bold yellow]")
-        )
-
     return Panel(
-        Group(*renderables),
-        title=f"[bold]Term Monitor — 终端监控   ({len(procs)} 个实例)[/bold]",
-        border_style=border,
-    )
-
-
-def build_web_monitor_panel() -> Panel:
-    procs_ports = find_web_monitor_processes()
-
-    if not procs_ports:
-        return Panel(
-            Text("● 未运行", style="bold red"),
-            title="[bold]Web Monitor — 网页监控[/bold]",
-            border_style="red",
-        )
-
-    border = "bright_blue" if len(procs_ports) == 1 else "yellow"
-
-    tbl = Table(box=box.SIMPLE, show_header=True, padding=(0, 1), expand=True)
-    tbl.add_column("PID", style="dim", width=7)
-    tbl.add_column("端口", width=6)
-    tbl.add_column("状态", width=8)
-    tbl.add_column("Tick 数", width=10, justify="right")
-    tbl.add_column("监控对数", width=8, justify="right")
-    tbl.add_column("期权数", width=7, justify="right")
-    tbl.add_column("信号数", width=6, justify="right")
-    tbl.add_column("最后扫描", width=10)
-    tbl.add_column("运行时长", width=8, justify="right")
-
-    for proc, port in procs_ports:
-        api = query_web_api(port)
-        if api:
-            raw_status = api.get("status", "?")
-            s_color = "bright_green" if raw_status == "运行中" else ("yellow" if "初始化" in raw_status else "red")
-            status_cell = f"[{s_color}]{raw_status}[/{s_color}]"
-            tick_count = f"{api.get('tick_count', 0):,}"
-            n_pairs = str(api.get("n_pairs", "?"))
-            n_opts = str(api.get("n_options", "?"))
-            n_sigs = len(api.get("signals", []))
-            sig_cell = f"[bold yellow]{n_sigs}[/bold yellow]" if n_sigs > 0 else "0"
-            last_scan = api.get("last_scan") or "—"
-        else:
-            status_cell = "[red]API 无响应[/red]"
-            tick_count = n_pairs = n_opts = last_scan = "—"
-            sig_cell = "—"
-
-        tbl.add_row(
-            str(proc.pid),
-            f"[cyan]:{port}[/cyan]",
-            Text.from_markup(status_cell),
-            tick_count,
-            n_pairs,
-            n_opts,
-            Text.from_markup(sig_cell),
-            last_scan,
-            _uptime(proc),
-        )
-
-    renderables: list = [tbl]
-    if len(procs_ports) > 1:
-        renderables.append(
-            Text.from_markup(
-                f"\n[bold yellow]⚠ 当前有 {len(procs_ports)} 个 web_monitor 实例同时运行[/bold yellow]"
-            )
-        )
-
-    return Panel(
-        Group(*renderables),
-        title=f"[bold]Web Monitor — 网页监控   ({len(procs_ports)} 个实例)[/bold]",
+        tbl,
+        title=f"[bold]Monitor — 进程监控   ({len(procs)} 个实例)[/bold]",
         border_style=border,
     )
 
@@ -415,8 +330,7 @@ def build_display(market_data_dir: str, iteration: int, refresh_secs: int) -> Gr
     return Group(
         header,
         build_recorder_panel(market_data_dir),
-        build_term_monitor_panel(),
-        build_web_monitor_panel(),
+        build_monitor_panel(),
     )
 
 
@@ -521,6 +435,7 @@ def parse_args() -> argparse.Namespace:
   python process_watcher.py --new-window                   # 在新窗口中启动（Windows）
   python process_watcher.py --merge                        # 合并今日分片并退出
   python process_watcher.py --merge --date 20260302        # 合并指定日期的分片
+  python process_watcher.py --debug                         # 调试：列出 monitor 进程，排查漏检
 """,
     )
     parser.add_argument(
@@ -550,7 +465,35 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="在新终端窗口中启动本程序（仅 Windows）",
     )
+    parser.add_argument(
+        "--debug",
+        action="store_true",
+        help="调试模式：列出所有含 monitor 的 Python 进程及其 cmdline，用于排查漏检",
+    )
     return parser.parse_args()
+
+
+def _run_debug() -> None:
+    """调试模式：列出所有含 monitor 的 Python 进程，便于排查漏检"""
+    console.print("[bold]调试：扫描含 'monitor' 的进程[/bold]\n")
+    found = 0
+    for p in psutil.process_iter(["pid", "cmdline", "create_time"]):
+        try:
+            cmd = _cmdline(p)
+            if not cmd:
+                continue
+            cmd_lower = cmd.lower()
+            if "monitor" not in cmd_lower:
+                continue
+            if "process_watcher" in cmd_lower:
+                console.print(f"[dim]排除 process_watcher: PID {p.pid}[/dim]")
+                continue
+            found += 1
+            console.print(f"  PID {p.pid}  运行 {_uptime(p)}")
+            console.print(f"    [dim]{cmd[:120]}{'...' if len(cmd) > 120 else ''}[/dim]\n")
+        except (psutil.NoSuchProcess, psutil.AccessDenied):
+            pass
+    console.print(f"[bold]共发现 {found} 个 monitor 实例[/bold]")
 
 
 def main() -> None:
@@ -558,6 +501,10 @@ def main() -> None:
         return
 
     args = parse_args()
+
+    if args.debug:
+        _run_debug()
+        return
 
     if args.merge:
         run_merge(args.market_data, args.date)

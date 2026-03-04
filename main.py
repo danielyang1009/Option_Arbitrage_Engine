@@ -62,7 +62,7 @@ def run_backtest(
     """
     from data_engine.tick_loader import TickLoader
     from data_engine.bar_loader import BarDataLoader
-    from data_engine.contract_info import ContractInfoManager
+    from data_engine.contract_info import ContractInfoManager, get_optionchain_path
     from data_engine.etf_simulator import ETFSimulator
     from strategies.pcp_arbitrage import PCPArbitrage
     from backtest.engine import BacktestEngine, MergedTick
@@ -74,12 +74,12 @@ def run_backtest(
     logger.info("=" * 60)
 
     contract_mgr = ContractInfoManager()
-    csv_path = Path(config.data_paths["contract_info_csv"])
-    if csv_path.exists():
-        count = contract_mgr.load_from_csv(csv_path)
-        logger.info("已加载 %d 条合约信息", count)
+    optionchain_path = get_optionchain_path()
+    if optionchain_path.exists():
+        count = contract_mgr.load_from_optionchain(optionchain_path)
+        logger.info("已从 optionchain 加载 %d 条合约信息", count)
     else:
-        logger.warning("合约信息文件不存在: %s", csv_path)
+        logger.warning("optionchain 文件不存在: %s，请开盘前执行 python fetch_optionchain.py", optionchain_path)
         logger.warning("将无法进行 Call/Put 配对，回测功能受限")
 
     # ========== 2. 加载 Tick 数据 ==========
@@ -382,8 +382,7 @@ def main() -> None:
         )
     elif args.mode == "monitor":
         print("实盘监控已迁移，请使用独立入口：")
-        print("  终端版: python -m monitors.term_monitor --source wind")
-        print("  网页版: python -m monitors.web_monitor")
+        print("  监控: python -m monitors.monitor --source wind")
 
 
 if __name__ == "__main__":

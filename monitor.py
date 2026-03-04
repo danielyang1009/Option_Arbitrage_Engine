@@ -1,6 +1,6 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
-"""启动入口（转发到 monitors.term_monitor）"""
+"""启动入口（转发到 monitors.monitor）"""
 import subprocess
 import sys
 from pathlib import Path
@@ -13,7 +13,7 @@ if "--new-window" in sys.argv and sys.platform == "win32":
     subprocess.Popen(cmd, creationflags=subprocess.CREATE_NEW_CONSOLE)
     sys.exit(0)
 
-from monitors.term_monitor import parse_args, run_monitor, run_monitor_zmq
+from monitors.monitor import parse_args, run_monitor, run_monitor_zmq
 
 if __name__ == "__main__":
     args = parse_args()

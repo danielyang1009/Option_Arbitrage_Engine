@@ -1,13 +1,13 @@
 # -*- coding: utf-8 -*-
 """
-DeltaZero — PCP 套利实时监控（终端版）
+DeltaZero — PCP 套利实时监控
 
 运行方法:
-    python term_monitor.py                          # 直连 Wind（默认）
-    python term_monitor.py --source zmq             # 从 recorder 进程读取
-    python term_monitor.py --min-profit 150         # 净利润阈值
-    python term_monitor.py --expiry-days 30         # 只看近月合约
-    python term_monitor.py --refresh 3              # 每3秒刷新
+    python monitor.py                          # 直连 Wind（默认）
+    python monitor.py --source zmq             # 从 recorder 进程读取
+    python monitor.py --min-profit 150         # 净利润阈值
+    python monitor.py --expiry-days 30         # 只看近月合约
+    python monitor.py --refresh 3              # 每3秒刷新
 """
 
 from __future__ import annotations
@@ -34,7 +34,6 @@ from rich.panel import Panel
 from rich.table import Table
 
 from monitors.common import (
-    CONTRACT_INFO_CSV,
     ETF_NAME_MAP,
     ETF_ORDER,
     build_pairs_and_codes,
@@ -43,10 +42,10 @@ from monitors.common import (
     load_active_contracts,
     parse_zmq_message,
     restore_from_snapshot,
+    select_display_pairs,
 )
 from models import (
     ETFTickData,
-    SignalType,
     TickData,
     TradeSignal,
     normalize_code,
@@ -106,7 +105,7 @@ def poll_snapshot(
         except Exception:
             pass
 
-    out: Dict[str, Dict] = {}
+    out: Dict[str, Dict[str, float]] = {}
     for i in range(0, len(codes), WIND_BATCH_SIZE):
         if i > 0:
             try:
@@ -184,22 +183,20 @@ def _build_etf_table(
     underlying: str,
     sigs: List[TradeSignal],
     price: float,
+    min_profit: float,
 ) -> Table:
-    """为单个品种构建信号表格"""
+    """为单个品种构建信号表格（固定显示 ATM 上下各 10 行）"""
     u_name = ETF_NAME_MAP.get(underlying.split(".")[0], underlying)
-    n_fwd = sum(1 for s in sigs if s.signal_type == SignalType.FORWARD)
-    n_rev = len(sigs) - n_fwd
-    border = "bright_green" if n_fwd > 0 else (_ETF_BORDER.get(underlying, "dim") if sigs else "dim")
+    n_profitable = sum(1 for s in sigs if s.net_profit_estimate >= min_profit)
+    border = "bright_green" if n_profitable > 0 else (_ETF_BORDER.get(underlying, "dim") if sigs else "dim")
 
     title_parts = [f"[bold]{u_name}[/bold]"]
     if price > 0:
         title_parts.append(f"[yellow]{price:.4f}[/yellow]")
-    if n_fwd > 0:
-        title_parts.append(f"[bold bright_green]正向 {n_fwd} 条[/bold bright_green]")
-    if n_rev > 0:
-        title_parts.append(f"[dim]反向 {n_rev} 条[/dim]")
+    if n_profitable > 0:
+        title_parts.append(f"[bold bright_green]正向 {n_profitable} 条[/bold bright_green]")
     if not sigs:
-        title_parts.append("[dim]暂无信号[/dim]")
+        title_parts.append("[dim]暂无数据[/dim]")
 
     tbl = Table(
         title="  ".join(title_parts),
@@ -211,20 +208,53 @@ def _build_etf_table(
         padding=(0, 1),
     )
     tbl.add_column("到期",   style="dim", width=5,  justify="center")
-    tbl.add_column("行权价",             width=7,  justify="right")
+    tbl.add_column("行权价",             width=8,  justify="left")
     tbl.add_column("方向",               width=4,  justify="center")
-    tbl.add_column("乘数",               width=5,  justify="right")
+    tbl.add_column("净利润",             width=8,  justify="right")
+    tbl.add_column("乘数",               width=6,  justify="right")
     tbl.add_column("C_b",               width=7,  justify="right")
     tbl.add_column("C_a",               width=7,  justify="right")
     tbl.add_column("P_b",               width=7,  justify="right")
     tbl.add_column("P_a",               width=7,  justify="right")
     tbl.add_column("S",                 width=7,  justify="right")
-    tbl.add_column("净利润", style="bold", width=8,  justify="right")
     tbl.add_column("明细",   style="dim", min_width=30)
 
     if not sigs:
-        tbl.add_row(*["—"] * 9, "[dim]暂无机会[/dim]", "—")
+        tbl.add_row(*["—"] * 9, "[dim]暂无数据[/dim]", "—")
         return tbl
+
+    def _add_sig_row(sig: TradeSignal) -> None:
+        profit = sig.net_profit_estimate
+        is_adj = sig.is_adjusted
+
+        if profit >= min_profit:
+            profit_str = f"[bold green]{profit:.0f}[/bold green]"
+            dir_str = "[bold green]正向[/bold green]"
+        elif profit >= 0:
+            profit_str = f"{profit:.0f}"
+            dir_str = "正向"
+        else:
+            profit_str = f"[dim]{profit:.0f}[/dim]"
+            dir_str = ""
+
+        mult_str = str(sig.multiplier)
+
+        adj_tag = " [dim]A[/dim]" if is_adj else ""
+        strike_str = f"{sig.strike:.2f}{adj_tag}"
+
+        tbl.add_row(
+            sig.expiry.strftime("%m-%d"),
+            strike_str,
+            dir_str,
+            profit_str,
+            mult_str,
+            f"{sig.call_bid:.4f}",
+            f"{sig.call_ask:.4f}",
+            f"{sig.put_bid:.4f}",
+            f"{sig.put_ask:.4f}",
+            f"{sig.spot_price:.4f}",
+            sig.calc_detail,
+        )
 
     normal = sorted(
         [s for s in sigs if not s.is_adjusted], key=lambda s: (s.expiry, s.strike)
@@ -233,86 +263,56 @@ def _build_etf_table(
         [s for s in sigs if s.is_adjusted], key=lambda s: (s.expiry, s.strike)
     )
 
-    def _add_sig_row(sig: TradeSignal, is_adj: bool) -> None:
-        profit = sig.net_profit_estimate
-        if profit >= 200:
-            ps = "bold bright_green"
-        elif profit >= 100:
-            ps = "bold green"
-        else:
-            ps = "yellow"
-        dir_str = (
-            "[bold]正向[/bold]"
-            if sig.signal_type == SignalType.FORWARD
-            else "[italic dim]反向[/italic dim]"
-        )
-        mult_str = (
-            f"[bold yellow]{sig.multiplier}[/bold yellow]"
-            if sig.multiplier != 10000
-            else "[dim]10000[/dim]"
-        )
-        adj_tag = "[dim italic](A)[/dim italic] " if is_adj else ""
-        tbl.add_row(
-            sig.expiry.strftime("%m-%d"),
-            f"{adj_tag}{sig.strike:.2f}",
-            dir_str,
-            mult_str,
-            f"{sig.call_bid:.4f}",
-            f"{sig.call_ask:.4f}",
-            f"{sig.put_bid:.4f}",
-            f"{sig.put_ask:.4f}",
-            f"{sig.spot_price:.4f}",
-            f"[{ps}]{profit:.0f}[/{ps}]",
-            sig.calc_detail,
-        )
-
-    for sig in normal[:20]:
-        _add_sig_row(sig, False)
+    for sig in normal:
+        _add_sig_row(sig)
     if adjusted and normal:
         tbl.add_section()
-    for sig in adjusted[:10]:
-        _add_sig_row(sig, True)
+    for sig in adjusted:
+        _add_sig_row(sig)
 
     return tbl
 
 
 def build_display(
-    signals: List[TradeSignal],
+    all_display_signals: List[TradeSignal],
     ts: datetime,
     etf_prices: Dict[str, float],
     n_pairs: int,
     n_option_codes: int,
     iteration: int,
     min_profit: float,
+    n_each_side: int = 10,
 ) -> RenderGroup:
-    """构建套利信号布局，按品种分块显示"""
+    """构建套利信号布局，按品种分块显示（每品种固定 ATM 上下各 n_each_side 行）"""
     etf_line = "  ".join(
         f"[cyan]{ETF_NAME_MAP.get(c.split('.')[0], c)}[/cyan]=[bold yellow]{p:.4f}[/bold yellow]"
         for c, p in etf_prices.items()
         if p > 0
     )
-    n_fwd = sum(1 for s in signals if s.signal_type == SignalType.FORWARD)
+    n_profitable = sum(1 for s in all_display_signals if s.net_profit_estimate >= min_profit)
     header = Panel(
         f"[bold bright_green]⚡ DeltaZero 套利监控[/bold bright_green]  "
         f"[dim]{ts.strftime('%H:%M:%S')}[/dim]  第 {iteration} 次刷新\n"
         f"{etf_line}\n"
         f"[dim]监控配对: {n_pairs} 组  订阅期权: {n_option_codes} 个  "
-        f"套利信号 (≥{min_profit:.0f}元): {len(signals)} 条"
-        f"  [bold bright_green]正向: {n_fwd}[/bold bright_green]"
-        f"  反向: {len(signals) - n_fwd}[/dim]",
+        f"有报价: {len(all_display_signals)} 条  "
+        f"[bold bright_green]正向机会 (≥{min_profit:.0f}元): {n_profitable}[/bold bright_green][/dim]",
         box=box.MINIMAL,
         padding=(0, 2),
     )
 
+    # 按品种分组，再各自按 ATM 上下各取 n_each_side
     groups: Dict[str, List[TradeSignal]] = defaultdict(list)
-    for sig in signals:
+    for sig in all_display_signals:
         groups[sig.underlying_code].append(sig)
 
     underlying_list = [c for c in ETF_ORDER if c in etf_prices]
-    tables = [
-        _build_etf_table(u, groups.get(u, []), etf_prices.get(u, 0.0))
-        for u in underlying_list
-    ]
+    tables = []
+    for u in underlying_list:
+        etf_px = etf_prices.get(u, 0.0)
+        u_sigs = groups.get(u, [])
+        display_sigs = select_display_pairs(u_sigs, etf_px, n_each_side) if u_sigs else []
+        tables.append(_build_etf_table(u, display_sigs, etf_px, min_profit))
 
     return RenderGroup(header, *tables)
 
@@ -324,7 +324,7 @@ def build_display(
 def run_monitor(
     min_profit: float = 30.0,
     expiry_days: int = 90,
-    refresh_secs: int = 5,
+    refresh_secs: int = 3,
     atm_range_pct: float = 0.20,
 ) -> None:
     """Wind 直连监控主循环"""
@@ -400,8 +400,7 @@ def run_monitor(
                     if tick:
                         strategy.on_option_tick(tick)
 
-                signals = strategy.scan_opportunities(pairs, current_time=ts)
-                last_signals = [s for s in signals if s.net_profit_estimate >= min_profit]
+                last_signals = strategy.scan_pairs_for_display(pairs, current_time=ts)
                 iteration += 1
                 live.update(render())
                 time.sleep(refresh_secs)
@@ -419,7 +418,7 @@ def run_monitor(
 def run_monitor_zmq(
     min_profit: float = 30.0,
     expiry_days: int = 90,
-    refresh_secs: int = 5,
+    refresh_secs: int = 3,
     atm_range_pct: float = 0.20,
     zmq_port: int = 5555,
     snapshot_dir: str = r"D:\MARKET_DATA",
@@ -435,7 +434,6 @@ def run_monitor_zmq(
 
     # 从快照恢复
     n_snap = 0
-    # 先用临时 strategy 做快照恢复，后面 init 会创建正式的
     from config.settings import get_default_config
     tmp_config = get_default_config()
     tmp_config.min_profit_threshold = min_profit
@@ -457,7 +455,6 @@ def run_monitor_zmq(
         console.print(f"[red]{e}[/red]")
         return
 
-    # 将快照恢复的状态注入正式 strategy
     if n_snap > 0:
         restore_from_snapshot(strategy, snapshot_dir, etf_prices)
 
@@ -470,7 +467,7 @@ def run_monitor_zmq(
     console.print(
         f"\n[bold green]ZMQ 模式监控已启动[/bold green]  "
         f"连接 tcp://127.0.0.1:{zmq_port}  "
-        f"刷新间隔 {refresh_secs}s  最小利润 {min_profit:.0f} 元  按 Ctrl+C 退出\n"
+        f"收到新数据即刷新（空闲时每 {refresh_secs}s）  最小利润 {min_profit:.0f} 元  按 Ctrl+C 退出\n"
     )
 
     iteration = 0
@@ -504,11 +501,10 @@ def run_monitor_zmq(
                     msgs_recv += 1
 
                 now = datetime.now()
-                if (now - last_scan).total_seconds() >= refresh_secs:
-                    signals = strategy.scan_opportunities(pairs, current_time=now)
-                    last_signals = [
-                        s for s in signals if s.net_profit_estimate >= min_profit
-                    ]
+                # 收到新数据即刷新；无数据时按 refresh_secs 周期刷新
+                should_refresh = msgs_recv > 0 or (now - last_scan).total_seconds() >= refresh_secs
+                if should_refresh:
+                    last_signals = strategy.scan_pairs_for_display(pairs, current_time=now)
                     iteration += 1
                     last_scan = now
                     live.update(render())
@@ -527,16 +523,16 @@ def run_monitor_zmq(
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="DeltaZero — PCP 套利实时监控（终端版）",
+        description="DeltaZero — PCP 套利实时监控",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 示例:
-  python term_monitor.py                          # 直连 Wind（默认）
-  python term_monitor.py --source zmq             # 从 recorder 进程读取
-  python term_monitor.py --min-profit 150         # 净利润阈值
-  python term_monitor.py --expiry-days 30         # 只看近月合约
-  python term_monitor.py --refresh 3              # 每3秒刷新
-  python term_monitor.py --source zmq --zmq-port 5556
+  python monitor.py                          # 直连 Wind（默认）
+  python monitor.py --source zmq             # 从 recorder 进程读取
+  python monitor.py --min-profit 150         # 净利润阈值
+  python monitor.py --expiry-days 30         # 只看近月合约
+  python monitor.py --refresh 3              # 每3秒刷新
+  python monitor.py --source zmq --zmq-port 5556
 """,
     )
     parser.add_argument(
@@ -545,7 +541,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--min-profit", type=float, default=30.0, help="最小显示净利润（元/组）")
     parser.add_argument("--expiry-days", type=int, default=90, help="最大到期天数")
-    parser.add_argument("--refresh", type=int, default=5, help="刷新间隔（秒）")
+    parser.add_argument("--refresh", type=int, default=3, help="刷新间隔（秒），ZMQ 模式收到新数据会立即刷新")
     parser.add_argument("--atm-range", type=float, default=0.20, help="ATM 距离过滤比例")
     parser.add_argument("--zmq-port", type=int, default=5555, help="ZMQ PUB 端口")
     parser.add_argument("--snapshot-dir", type=str, default=r"D:\MARKET_DATA", help="快照文件目录")
