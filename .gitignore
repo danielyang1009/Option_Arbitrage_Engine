@@ -16,7 +16,7 @@ venv/
 env/
 
 # 大型数据文件（本地路径，不上传）
-tick_data/
+metadata/
 *.parquet
 *.feather
 
