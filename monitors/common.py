@@ -22,7 +22,7 @@ import math
 import os
 import sys
 from collections import defaultdict
-from datetime import date, datetime, timedelta
+from datetime import date, datetime
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple, Union
 
@@ -34,7 +34,7 @@ from models import (
     TickData,
     TradeSignal,
 )
-from config.settings import TradingConfig, get_default_config
+from config.settings import ETF_CODE_TO_NAME, UNDERLYINGS, TradingConfig, get_default_config
 from data_engine.contract_info import ContractInfoManager, get_optionchain_path
 from strategies.pcp_arbitrage import PCPArbitrage
 
@@ -68,18 +68,12 @@ def fix_windows_encoding() -> None:
 # ══════════════════════════════════════════════════════════════════════
 
 ETF_NAME_MAP: Dict[str, str] = {
-    "510050": "50ETF",
-    "510300": "300ETF",
-    "510500": "500ETF",
-    "588000": "科创50",
-    "588050": "科创板50",
+    code.split(".")[0]: name for code, name in ETF_CODE_TO_NAME.items()
 }
 
-ETF_ORDER: List[str] = ["510050.SH", "510300.SH", "510500.SH"]
+ETF_ORDER: List[str] = list(UNDERLYINGS)
 
-MONITOR_UNDERLYINGS = {"510050.SH", "510300.SH", "510500.SH"}
-
-PROJECT_ROOT: Path = Path(__file__).resolve().parent.parent
+MONITOR_UNDERLYINGS = set(UNDERLYINGS)
 
 
 
@@ -395,12 +389,12 @@ def init_strategy_and_contracts(
     strategy = PCPArbitrage(config)
 
     contract_mgr = ContractInfoManager()
-    optionchain_csv = get_optionchain_path()
+    optionchain_csv = get_optionchain_path(target_date=date.today())
     if not optionchain_csv.exists():
         raise FileNotFoundError(
             f"optionchain 文件不存在: {optionchain_csv}，请开盘前执行 python fetch_optionchain.py"
         )
-    n = contract_mgr.load_from_optionchain(optionchain_csv)
+    n = contract_mgr.load_from_optionchain(optionchain_csv, target_date=date.today())
     _log(f"已从 optionchain 加载 {n} 条合约信息")
 
     active = load_active_contracts(contract_mgr, expiry_days)

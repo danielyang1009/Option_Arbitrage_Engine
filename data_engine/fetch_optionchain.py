@@ -4,7 +4,7 @@
 
 用法:
     python -m data_engine.fetch_optionchain [--date YYYY-MM-DD]
-    python fetch_optionchain.py [--date YYYY-MM-DD]
+    python -m data_engine.fetch_optionchain --timeout 90 --retry 2
 
 输出: metadata/YYYY-MM-DD_optionchain.csv
 """
@@ -14,21 +14,33 @@ from __future__ import annotations
 import argparse
 import logging
 import sys
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
 from datetime import date, datetime
 from pathlib import Path
 
+from config.settings import UNDERLYINGS
+from utils.wind_helpers import wind_connect
+
 logger = logging.getLogger(__name__)
 
-# 监控的标的（与 monitors/common 一致）
-UNDERLYINGS = ["510050.SH", "510300.SH", "510500.SH"]
+# Wind 错误码 -40521010 表示网络超时
+WIND_ERROR_NETWORK_TIMEOUT = -40521010
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 METADATA_DIR = PROJECT_ROOT / "metadata"
 
 
+def _errmsg(err: int) -> str:
+    if err == WIND_ERROR_NETWORK_TIMEOUT:
+        return "网络超时 (Network Timeout)"
+    return f"ErrorCode={err}"
+
+
 def fetch_optionchain_from_wind(
     target_date: date,
     underlyings: list[str] | None = None,
+    timeout_sec: int = 60,
+    retry: int = 1,
 ):
     """
     从 Wind wset 抓取期权链，包含合约乘数等信息。
@@ -36,6 +48,8 @@ def fetch_optionchain_from_wind(
     Args:
         target_date: 查询日期
         underlyings: 标的代码列表，默认 50/300/500 ETF
+        timeout_sec: 单次请求超时秒数，超时则报错或重试
+        retry: 失败/超时后的重试次数（0=不重试）
 
     Returns:
         pandas DataFrame，多标的合并去重
@@ -52,50 +66,88 @@ def fetch_optionchain_from_wind(
     date_str = target_date.strftime("%Y-%m-%d")
     dfs = []
 
-    result = w.start()
-    if result.ErrorCode != 0:
-        raise RuntimeError(f"Wind 连接失败，ErrorCode={result.ErrorCode}")
+    if not wind_connect(w, timeout=30, retries=3, delay_secs=2.0, logger=logger):
+        raise RuntimeError("Wind 连接失败")
 
-    for us_code in underlyings:
+    def _fetch_one(opts: str) -> pd.DataFrame | None:
+        """单次请求，带 usedf。若 TypeError 则回退到非 usedf 格式。"""
         try:
-            # 优先 usedf=True 获取 DataFrame；若不支持则用 WindData 转 DataFrame
-            opts = f"date={date_str};us_code={us_code};option_var=all;call_put=all"
             raw = w.wset("optionchain", opts, usedf=True)
-            if raw is None:
-                logger.warning("wset optionchain 返回 None: us_code=%s", us_code)
-                continue
-            # 兼容 (ErrorCode, DataFrame) 或 直接 DataFrame
-            if isinstance(raw, tuple):
-                err, df = raw[0], raw[1]
-                if err != 0 or df is None or (hasattr(df, "empty") and df.empty):
-                    logger.warning("wset optionchain 失败: us_code=%s ErrorCode=%s", us_code, err)
-                    continue
-            else:
-                df = raw
-                if df is None or (hasattr(df, "empty") and df.empty):
-                    logger.warning("wset optionchain 返回空: us_code=%s", us_code)
-                    continue
-            dfs.append(df)
         except TypeError:
-            # usedf 可能不被支持，回退到 WindData
-            try:
-                result = w.wset("optionchain", opts)
-                if result is None or result.ErrorCode != 0:
-                    logger.warning("wset optionchain 失败: us_code=%s", us_code)
+            res = w.wset("optionchain", opts)
+            if res is None or res.ErrorCode != 0:
+                return None
+            fields = getattr(res, "Fields", []) or []
+            data = getattr(res, "Data", []) or []
+            if not data or not fields:
+                return None
+            return pd.DataFrame(
+                {fields[j]: data[j] for j in range(min(len(fields), len(data)))}
+            )
+        if raw is None:
+            return None
+        if isinstance(raw, tuple):
+            err, df = raw[0], raw[1]
+            if err != 0 or df is None or (hasattr(df, "empty") and df.empty):
+                raise _WindError(err)
+            return df
+        if raw is None or (hasattr(raw, "empty") and raw.empty):
+            return None
+        return raw
+
+    class _WindError(Exception):
+        def __init__(self, err: int):
+            self.err = err
+            super().__init__(_errmsg(err))
+
+    total = len(underlyings)
+    try:
+        for idx, us_code in enumerate(underlyings):
+            print(f"PROGRESS:{idx}/{total}:{us_code}", flush=True)
+            opts = f"date={date_str};us_code={us_code};option_var=all;call_put=all"
+            df = None
+            last_err: str | None = None
+
+            for attempt in range(retry + 1):
+                try:
+                    with ThreadPoolExecutor(max_workers=1) as ex:
+                        fut = ex.submit(_fetch_one, opts)
+                        df = fut.result(timeout=timeout_sec)
+                except FuturesTimeoutError:
+                    last_err = f"请求超时（{timeout_sec}s 内无响应）"
+                    logger.warning("wset optionchain %s: us_code=%s", last_err, us_code)
+                    if attempt < retry:
+                        logger.info("重试 %s (%d/%d)", us_code, attempt + 2, retry + 1)
                     continue
-                fields = getattr(result, "Fields", []) or []
-                data = getattr(result, "Data", []) or []
-                if not data or not fields:
+                except _WindError as e:
+                    last_err = str(e)
+                    logger.warning("wset optionchain 失败: us_code=%s %s", us_code, last_err)
+                    if attempt < retry and e.err == WIND_ERROR_NETWORK_TIMEOUT:
+                        logger.info("网络超时，重试 %s (%d/%d)", us_code, attempt + 2, retry + 1)
+                        continue
                     continue
-                df = pd.DataFrame(
-                    {fields[j]: data[j] for j in range(min(len(fields), len(data)))}
-                )
-                if not df.empty:
+                except Exception as e:
+                    last_err = str(e)
+                    logger.warning("抓取 %s 期权链异常: %s", us_code, e)
+                    if attempt < retry:
+                        logger.info("重试 %s (%d/%d)", us_code, attempt + 2, retry + 1)
+                    continue
+
+                if df is not None and (not hasattr(df, "empty") or not df.empty):
                     dfs.append(df)
-            except Exception as e:
-                logger.warning("抓取 %s 期权链异常: %s", us_code, e)
-        except Exception as e:
-            logger.warning("抓取 %s 期权链异常: %s", us_code, e)
+                else:
+                    last_err = "返回空数据"
+                break
+            else:
+                if last_err:
+                    logger.warning("跳过 %s（%s，已重试 %d 次）", us_code, last_err, retry)
+    finally:
+        try:
+            w.stop()
+        except Exception:
+            pass
+
+    print(f"PROGRESS:{total}/{total}:done", flush=True)
 
     if not dfs:
         return pd.DataFrame()
@@ -121,6 +173,18 @@ def main() -> int:
         default=None,
         help="查询日期 YYYY-MM-DD，默认今日",
     )
+    parser.add_argument(
+        "--timeout",
+        type=int,
+        default=60,
+        help="单次请求超时秒数（默认 60），超时或 -40521010 网络超时时会重试",
+    )
+    parser.add_argument(
+        "--retry",
+        type=int,
+        default=1,
+        help="失败/超时后的重试次数（默认 1）",
+    )
     args = parser.parse_args()
 
     if args.date:
@@ -135,9 +199,13 @@ def main() -> int:
     METADATA_DIR.mkdir(parents=True, exist_ok=True)
     out_path = METADATA_DIR / f"{target_date.strftime('%Y-%m-%d')}_optionchain.csv"
 
-    print(f"正在从 Wind 抓取 {target_date} 期权链...")
+    print(f"正在从 Wind 抓取 {target_date} 期权链（超时 {args.timeout}s，重试 {args.retry} 次）...")
     try:
-        df = fetch_optionchain_from_wind(target_date)
+        df = fetch_optionchain_from_wind(
+            target_date,
+            timeout_sec=args.timeout,
+            retry=args.retry,
+        )
     except RuntimeError as e:
         print(f"抓取失败: {e}")
         return 1

@@ -104,7 +104,7 @@ class Account:
         Returns:
             成交记录列表（成功执行返回3条记录，失败返回空列表）
         """
-        unit = self.config.contract_unit
+        unit = signal.multiplier  # 使用该合约的真实乘数（调整型合约可能≠10000）
         fee = self.config.fee
         slp = self.config.slippage
 
@@ -158,6 +158,7 @@ class Account:
             self._update_position(
                 signal.underlying_code, AssetType.ETF,
                 OrderSide.BUY, etf_exec_price, etf_quantity,
+                contracts=contracts,
             )
             self._etf_buy_dates[signal.underlying_code] = signal.timestamp.date()
             self.cash -= (etf_cost + etf_comm)
@@ -172,6 +173,7 @@ class Account:
             self._update_position(
                 signal.put_code, AssetType.OPTION,
                 OrderSide.BUY, put_exec_price, num_sets,
+                contracts=contracts,
             )
             self.cash -= (put_cost + put_comm)
 
@@ -185,6 +187,7 @@ class Account:
             self._update_position(
                 signal.call_code, AssetType.OPTION,
                 OrderSide.SELL, call_exec_price, num_sets,
+                contracts=contracts,
             )
             self.cash += (call_revenue - call_comm)
 
@@ -233,14 +236,14 @@ class Account:
     def update_unrealized_pnl(
         self,
         market_prices: Dict[str, float],
-        contract_unit: int,
+        contracts: Optional[Dict[str, ContractInfo]] = None,
     ) -> float:
         """
         更新未实现盈亏
 
         Args:
             market_prices: 合约代码 -> 最新价格
-            contract_unit: 合约单位
+            contracts: 合约信息字典，用于按合约获取真实乘数（调整型合约≠10000）
 
         Returns:
             总未实现盈亏
@@ -254,7 +257,12 @@ class Account:
                 continue
 
             if pos.asset_type == AssetType.OPTION:
-                unrealized = (current_price - pos.avg_cost) * pos.quantity * contract_unit
+                unit = (
+                    contracts[code].contract_unit
+                    if contracts and code in contracts
+                    else self.config.contract_unit
+                )
+                unrealized = (current_price - pos.avg_cost) * pos.quantity * unit
             else:
                 unrealized = (current_price - pos.avg_cost) * pos.quantity
 
@@ -269,6 +277,8 @@ class Account:
         side: OrderSide,
         price: float,
         quantity: int,
+        *,
+        contracts: Optional[Dict[str, ContractInfo]] = None,
     ) -> None:
         """更新持仓"""
         if code not in self.positions:
@@ -286,7 +296,11 @@ class Account:
             pos.quantity = new_qty
         else:
             close_qty = min(abs(pos.quantity), abs(signed_qty))
-            unit = self.config.contract_unit if asset_type == AssetType.OPTION else 1
+            if asset_type == AssetType.OPTION and contracts:
+                info = contracts.get(code)
+                unit = info.contract_unit if info else self.config.contract_unit
+            else:
+                unit = self.config.contract_unit if asset_type == AssetType.OPTION else 1
 
             if pos.quantity > 0:
                 realized = (price - pos.avg_cost) * close_qty * unit
@@ -384,6 +398,7 @@ class BacktestEngine:
         Returns:
             回测结果字典，包含交易记录、信号、权益曲线等
         """
+        self.contracts = contracts
         merged = self._merge_tick_streams(option_ticks, etf_ticks)
         logger.info("回测开始：共 %d 个 Tick 事件", len(merged))
 
@@ -418,7 +433,7 @@ class BacktestEngine:
             if i % 100 == 0 or i == len(merged) - 1:
                 market_prices = self._get_latest_prices(mtick)
                 unrealized = self.account.update_unrealized_pnl(
-                    market_prices, self.config.contract_unit,
+                    market_prices, self.contracts,
                 )
                 equity = self.account.cash + unrealized
                 self.equity_curve.append((mtick.timestamp, equity))
@@ -466,7 +481,7 @@ class BacktestEngine:
 
     def _calc_max_sets(self, signal: TradeSignal, underlying_close: float) -> int:
         """根据可用资金估算最大开仓组数"""
-        unit = self.config.contract_unit
+        unit = signal.multiplier  # 使用该合约的真实乘数
         etf_cost_per_set = signal.spot_price * unit
         margin_per_set = underlying_close * unit * self.config.margin.call_margin_ratio_1
         cost_per_set = etf_cost_per_set + margin_per_set

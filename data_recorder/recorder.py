@@ -20,30 +20,18 @@
 from __future__ import annotations
 
 import argparse
-import ctypes
-import io
 import logging
-import os
 import sys
 import time
 from datetime import date, datetime
 from pathlib import Path
 from queue import Empty, Queue
 
-# ── Windows UTF-8 编码修复 ────────────────────────────────────────────
-if sys.platform == "win32":
-    ctypes.windll.kernel32.SetConsoleOutputCP(65001)
-    ctypes.windll.kernel32.SetConsoleCP(65001)
-    try:
-        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
-        sys.stderr.reconfigure(encoding="utf-8", errors="replace")
-    except AttributeError:
-        sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", errors="replace")
-        sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding="utf-8", errors="replace")
-    os.environ["PYTHONIOENCODING"] = "utf-8"
-
 # 将项目根目录加入 Python 路径
 sys.path.insert(0, str(Path(__file__).parent.parent))
+
+from monitors.common import fix_windows_encoding
+fix_windows_encoding()
 
 from config.settings import get_recorder_config, RecorderConfig
 from data_recorder.parquet_writer import ParquetWriter

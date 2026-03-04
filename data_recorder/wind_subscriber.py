@@ -18,14 +18,19 @@ Wind 在行情有变动时主动调用 callback，callback 将 tick 放入线程
 from __future__ import annotations
 
 import logging
-import math
 from datetime import date, datetime
-from pathlib import Path
 from queue import Queue
 from typing import Callable, Dict, List, Optional, Tuple
 
 from models import ETFTickData, TickData, normalize_code
 from data_engine.contract_info import ContractInfoManager, get_optionchain_path
+from utils.wind_helpers import (
+    wind_connect,
+    wind_row_to_etf_tick,
+    wind_row_to_etf_tick_row,
+    wind_row_to_option_tick,
+    wind_row_to_option_tick_row,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -38,27 +43,6 @@ ETF_FIELDS    = "rt_last,rt_ask1,rt_bid1"
 # ──────────────────────────────────────────────────────────────────────
 # Tick 解析工具
 # ──────────────────────────────────────────────────────────────────────
-
-def _fval(row: dict, key: str, default: float = math.nan) -> float:
-    v = row.get(key)
-    if v is None:
-        return default
-    try:
-        f = float(v)
-        return default if math.isnan(f) else f
-    except (TypeError, ValueError):
-        return default
-
-
-def _ival(row: dict, key: str, default: int = 0) -> int:
-    v = row.get(key)
-    if v is None:
-        return default
-    try:
-        return int(float(v))
-    except (TypeError, ValueError):
-        return default
-
 
 def _parse_indata_row(indata, j: int) -> dict:
     """
@@ -78,83 +62,6 @@ def _parse_indata_row(indata, j: int) -> dict:
         except (IndexError, TypeError):
             row[fn.upper()] = None
     return row
-
-
-def build_option_tick_row(code: str, underlying: str, row: dict, ts: datetime) -> Optional[dict]:
-    """将 Wind 原始字段字典转为 parquet_writer 所需的 dict"""
-    last = _fval(row, "RT_LAST", 0.0)
-    ask1 = _fval(row, "RT_ASK1")
-    bid1 = _fval(row, "RT_BID1")
-    if last <= 0 or math.isnan(ask1) or math.isnan(bid1):
-        return None
-    if ask1 <= 0 or bid1 <= 0 or ask1 < bid1:
-        return None
-    return {
-        "ts":         int(ts.timestamp() * 1000),
-        "code":       code,
-        "underlying": underlying,
-        "last":       float(last),
-        "ask1":       float(ask1),
-        "bid1":       float(bid1),
-        "oi":         _ival(row, "RT_OI"),
-        "vol":        _ival(row, "RT_VOL"),
-        "high":       float(_fval(row, "RT_HIGH", last)),
-        "low":        float(_fval(row, "RT_LOW",  last)),
-    }
-
-
-def build_etf_tick_row(code: str, row: dict, ts: datetime) -> Optional[dict]:
-    """将 Wind 原始字段字典转为 ETF parquet_writer 所需的 dict"""
-    last = _fval(row, "RT_LAST", 0.0)
-    if last <= 0:
-        return None
-    return {
-        "ts":   int(ts.timestamp() * 1000),
-        "code": code,
-        "last": float(last),
-        "ask1": float(_fval(row, "RT_ASK1")),
-        "bid1": float(_fval(row, "RT_BID1")),
-    }
-
-
-def option_row_to_tick(code: str, row: dict, ts: datetime) -> Optional[TickData]:
-    """将 Wind 原始字段字典转为 TickData（供 ZMQ 广播和策略使用）"""
-    last = _fval(row, "RT_LAST", 0.0)
-    ask1 = _fval(row, "RT_ASK1")
-    bid1 = _fval(row, "RT_BID1")
-    if last <= 0 or math.isnan(ask1) or math.isnan(bid1):
-        return None
-    if ask1 <= 0 or bid1 <= 0 or ask1 < bid1:
-        return None
-    return TickData(
-        timestamp=ts,
-        contract_code=code,
-        current=float(last),
-        volume=_ival(row, "RT_VOL"),
-        high=float(_fval(row, "RT_HIGH", last)),
-        low=float(_fval(row, "RT_LOW",  last)),
-        money=0.0,
-        position=_ival(row, "RT_OI"),
-        ask_prices=[float(ask1)] + [math.nan] * 4,
-        ask_volumes=[100] + [0] * 4,
-        bid_prices=[float(bid1)] + [math.nan] * 4,
-        bid_volumes=[100] + [0] * 4,
-    )
-
-
-def etf_row_to_tick(code: str, row: dict, ts: datetime) -> Optional[ETFTickData]:
-    """将 Wind 原始字段字典转为 ETFTickData"""
-    last = _fval(row, "RT_LAST", 0.0)
-    if last <= 0:
-        return None
-    return ETFTickData(
-        timestamp=ts,
-        etf_code=code,
-        price=float(last),
-        ask_price=float(_fval(row, "RT_ASK1")),
-        bid_price=float(_fval(row, "RT_BID1")),
-        is_simulated=False,
-    )
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -231,9 +138,8 @@ class WindSubscriber:
             return False
 
         # 2. 连接 Wind
-        result = self._w.start()
-        if result.ErrorCode != 0:
-            logger.error("Wind 连接失败 ErrorCode=%d", result.ErrorCode)
+        if not wind_connect(self._w, timeout=30, retries=3, delay_secs=2.0, logger=logger):
+            logger.error("Wind 连接失败，超过重试次数")
             return False
         logger.info("Wind 连接成功")
 
@@ -274,13 +180,13 @@ class WindSubscriber:
 
     def _load_contracts(self) -> None:
         """从 CSV 加载合约信息，筛选出目标品种的活跃合约"""
-        optionchain_csv = get_optionchain_path(metadata_dir=Path(__file__).parent.parent / "metadata")
+        optionchain_csv = get_optionchain_path(target_date=date.today())
         if not optionchain_csv.exists():
             logger.error("optionchain 文件不存在: %s，请开盘前执行 python fetch_optionchain.py", optionchain_csv)
             return
 
         mgr = ContractInfoManager()
-        mgr.load_from_optionchain(optionchain_csv)
+        mgr.load_from_optionchain(optionchain_csv, target_date=date.today())
 
         today = date.today()
         product_set = set(self._products)
@@ -319,25 +225,31 @@ class WindSubscriber:
         ]
         for idx, batch in enumerate(batches):
             cb = self._make_option_callback()
-            result = self._w.wsq(",".join(batch), OPTION_FIELDS, func=cb)
-            if result is None or result.ErrorCode not in (0, None):
+            ok = False
+            for attempt in range(1, 3):
+                result = self._w.wsq(",".join(batch), OPTION_FIELDS, func=cb)
+                if result is not None and result.ErrorCode in (0, None):
+                    logger.info(
+                        "期权批次 %d/%d 订阅成功 (%d 代码 × 7字段 = %d 数据点)",
+                        idx + 1, len(batches), len(batch), len(batch) * 7,
+                    )
+                    ok = True
+                    break
                 err = getattr(result, "ErrorCode", "unknown")
-                logger.warning("期权批次 %d wsq 订阅失败 ErrorCode=%s", idx + 1, err)
-            else:
-                logger.info(
-                    "期权批次 %d/%d 订阅成功 (%d 代码 × 7字段 = %d 数据点)",
-                    idx + 1, len(batches), len(batch), len(batch) * 7,
-                )
+                logger.warning("期权批次 %d wsq 订阅失败 ErrorCode=%s (重试 %d/2)", idx + 1, err, attempt)
+            if not ok:
+                logger.error("期权批次 %d 最终订阅失败", idx + 1)
 
         # -- ETF --
         if self._etf_codes:
             cb_etf = self._make_etf_callback()
-            result = self._w.wsq(",".join(self._etf_codes), ETF_FIELDS, func=cb_etf)
-            if result is None or result.ErrorCode not in (0, None):
+            for attempt in range(1, 3):
+                result = self._w.wsq(",".join(self._etf_codes), ETF_FIELDS, func=cb_etf)
+                if result is not None and result.ErrorCode in (0, None):
+                    logger.info("ETF 订阅成功: %s", self._etf_codes)
+                    break
                 err = getattr(result, "ErrorCode", "unknown")
-                logger.warning("ETF wsq 订阅失败 ErrorCode=%s", err)
-            else:
-                logger.info("ETF 订阅成功: %s", self._etf_codes)
+                logger.warning("ETF wsq 订阅失败 ErrorCode=%s (重试 %d/2)", err, attempt)
 
     # ──────────────────────────────────────────────────────────
     # 内部：回调闭包工厂
@@ -365,8 +277,8 @@ class WindSubscriber:
                 if not underlying:
                     continue
                 row = _parse_indata_row(indata, j)
-                tick_row = build_option_tick_row(code, underlying, row, ts)
-                tick_obj = option_row_to_tick(code, row, ts)
+                tick_row = wind_row_to_option_tick_row(code, underlying, row, ts)
+                tick_obj = wind_row_to_option_tick(code, row, ts)
                 if tick_row and tick_obj:
                     tick_row["is_adjusted"] = code in adjusted_set
                     tick_row["multiplier"]  = mult_map.get(code, 10000)
@@ -395,8 +307,8 @@ class WindSubscriber:
             for j, raw_code in enumerate(indata.Codes):
                 code = normalize_code(raw_code, ".SH")
                 row = _parse_indata_row(indata, j)
-                tick_row = build_etf_tick_row(code, row, ts)
-                tick_obj = etf_row_to_tick(code, row, ts)
+                tick_row = wind_row_to_etf_tick_row(code, row, ts)
+                tick_obj = wind_row_to_etf_tick(code, row, ts)
                 if tick_row and tick_obj:
                     pkt = TickPacket(
                         is_etf=True,

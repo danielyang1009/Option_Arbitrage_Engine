@@ -56,7 +56,12 @@ class ContractInfoManager:
         self.contracts: Dict[str, ContractInfo] = {}
         self._pairs_cache: Dict[str, List[Tuple[ContractInfo, ContractInfo]]] = {}
 
-    def load_from_optionchain(self, csv_path: str | Path) -> int:
+    def load_from_optionchain(
+        self,
+        csv_path: str | Path,
+        target_date: Optional[date] = None,
+        max_age_days: int = 7,
+    ) -> int:
         """
         从 optionchain CSV（fetch_optionchain 产出）加载合约信息，含乘数。
 
@@ -65,6 +70,8 @@ class ContractInfoManager:
 
         Args:
             csv_path: metadata/YYYY-MM-DD_optionchain.csv 路径
+            target_date: 目标日期，用于校验文件是否过期（不传则用今日）
+            max_age_days: 文件日期与目标日期允许的最大偏差（天），超限则告警
 
         Returns:
             成功加载的合约数量
@@ -75,6 +82,22 @@ class ContractInfoManager:
         csv_path = Path(csv_path)
         if not csv_path.exists():
             raise FileNotFoundError(f"optionchain 文件不存在: {csv_path}")
+
+        # 版本校验：从文件名提取日期，防止使用过期乘数
+        try:
+            stem = csv_path.stem  # e.g. 2026-03-04_optionchain
+            file_date_str = stem.split("_")[0]
+            file_date = datetime.strptime(file_date_str, "%Y-%m-%d").date()
+            check_date = target_date or date.today()
+            age_days = abs((file_date - check_date).days)
+            if age_days > max_age_days:
+                logger.warning(
+                    "optionchain 文件可能过期: %s (文件日期 %s, 目标 %s, 相差 %d 天)，"
+                    "乘数可能不准确，请开盘前执行 fetch_optionchain",
+                    csv_path.name, file_date, check_date, age_days,
+                )
+        except (ValueError, IndexError):
+            pass
 
         logger.info("加载合约信息: %s", csv_path)
         count = 0

@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-DeltaZero — PCP 套利实时监控
+DeltaZero — PCP 正向套利实时监控
 
 运行方法:
     python monitor.py                          # 直连 Wind（默认）
@@ -13,9 +13,9 @@ DeltaZero — PCP 套利实时监控
 from __future__ import annotations
 
 import argparse
-import math
 import sys
 import time
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
 from collections import defaultdict
 from datetime import datetime
 from pathlib import Path
@@ -39,18 +39,24 @@ from monitors.common import (
     build_pairs_and_codes,
     estimate_etf_fallback_prices,
     init_strategy_and_contracts,
-    load_active_contracts,
     parse_zmq_message,
     restore_from_snapshot,
     select_display_pairs,
 )
+from config.settings import DEFAULT_MARKET_DATA_DIR, UNDERLYINGS
 from models import (
     ETFTickData,
-    TickData,
     TradeSignal,
     normalize_code,
 )
+from calculators.vix_engine import VIXEngine, VIXResult
 from strategies.pcp_arbitrage import PCPArbitrage
+from utils.wind_helpers import (
+    fval,
+    wind_connect,
+    wind_row_to_etf_tick,
+    wind_row_to_option_tick,
+)
 
 console = Console(legacy_windows=False, highlight=True)
 
@@ -67,29 +73,8 @@ logging.basicConfig(
 # ──────────────────────────────────────────────────────────────────────
 
 WIND_OPTION_FIELDS = "rt_last,rt_ask1,rt_bid1"
-WIND_ETF_FIELDS    = "rt_last,rt_ask1,rt_bid1"
-WIND_BATCH_SIZE    = 300
-
-
-def _fval(d: dict, key: str, default: float = math.nan) -> float:
-    v = d.get(key)
-    if v is None:
-        return default
-    try:
-        f = float(v)
-        return default if math.isnan(f) else f
-    except (TypeError, ValueError):
-        return default
-
-
-def _ival(d: dict, key: str, default: int = 0) -> int:
-    v = d.get(key)
-    if v is None:
-        return default
-    try:
-        return int(float(v))
-    except (TypeError, ValueError):
-        return default
+WIND_ETF_FIELDS = "rt_last,rt_ask1,rt_bid1"
+WIND_BATCH_SIZE = 300
 
 
 def poll_snapshot(
@@ -97,6 +82,7 @@ def poll_snapshot(
     codes: List[str],
     fields: str = WIND_OPTION_FIELDS,
     cancel_before: bool = False,
+    timeout_sec: int = 5,
 ) -> Dict[str, Dict[str, float]]:
     """批量拉取 Wind 实时行情快照（同步 wsq）"""
     if cancel_before:
@@ -113,7 +99,11 @@ def poll_snapshot(
             except Exception:
                 pass
         batch = codes[i : i + WIND_BATCH_SIZE]
-        result = w.wsq(",".join(batch), fields)
+        try:
+            with ThreadPoolExecutor(max_workers=1) as ex:
+                result = ex.submit(w.wsq, ",".join(batch), fields).result(timeout=timeout_sec)
+        except (FuturesTimeoutError, Exception):
+            continue
         if result is None or result.ErrorCode != 0:
             continue
         field_names = [f.upper() for f in result.Fields]
@@ -128,46 +118,6 @@ def poll_snapshot(
     return out
 
 
-def make_option_tick(code: str, q: Dict, ts: datetime) -> Optional[TickData]:
-    """将 Wind 行情字典转为 TickData"""
-    last = _fval(q, "RT_LAST", 0.0)
-    ask1 = _fval(q, "RT_ASK1")
-    bid1 = _fval(q, "RT_BID1")
-    if last <= 0 or math.isnan(ask1) or math.isnan(bid1):
-        return None
-    if ask1 <= 0 or bid1 <= 0 or ask1 < bid1:
-        return None
-    return TickData(
-        timestamp=ts,
-        contract_code=code,
-        current=last,
-        volume=0,
-        high=last,
-        low=last,
-        money=0.0,
-        position=_ival(q, "RT_OI"),
-        ask_prices=[ask1] + [math.nan] * 4,
-        ask_volumes=[100] + [0] * 4,
-        bid_prices=[bid1] + [math.nan] * 4,
-        bid_volumes=[100] + [0] * 4,
-    )
-
-
-def make_etf_tick(code: str, q: Dict, ts: datetime) -> Optional[ETFTickData]:
-    """将 Wind 行情字典转为 ETFTickData"""
-    last = _fval(q, "RT_LAST", 0.0)
-    if last <= 0:
-        return None
-    return ETFTickData(
-        timestamp=ts,
-        etf_code=code,
-        price=last,
-        ask_price=_fval(q, "RT_ASK1"),
-        bid_price=_fval(q, "RT_BID1"),
-        is_simulated=False,
-    )
-
-
 # ──────────────────────────────────────────────────────────────────────
 # Rich 显示构建
 # ──────────────────────────────────────────────────────────────────────
@@ -178,12 +128,15 @@ _ETF_BORDER = {
     "510500.SH": "bright_magenta",
 }
 
+_VIX_TARGETS = list(UNDERLYINGS)
+
 
 def _build_etf_table(
     underlying: str,
     sigs: List[TradeSignal],
     price: float,
     min_profit: float,
+    vix_value: Optional[float] = None,
 ) -> Table:
     """为单个品种构建信号表格（固定显示 ATM 上下各 10 行）"""
     u_name = ETF_NAME_MAP.get(underlying.split(".")[0], underlying)
@@ -193,6 +146,8 @@ def _build_etf_table(
     title_parts = [f"[bold]{u_name}[/bold]"]
     if price > 0:
         title_parts.append(f"[yellow]{price:.4f}[/yellow]")
+    if vix_value is not None:
+        title_parts.append(f"[magenta]VIX {vix_value:.2f}[/magenta]")
     if n_profitable > 0:
         title_parts.append(f"[bold bright_green]正向 {n_profitable} 条[/bold bright_green]")
     if not sigs:
@@ -277,6 +232,7 @@ def build_display(
     all_display_signals: List[TradeSignal],
     ts: datetime,
     etf_prices: Dict[str, float],
+    vix_values: Dict[str, Optional[float]],
     n_pairs: int,
     n_option_codes: int,
     iteration: int,
@@ -289,11 +245,17 @@ def build_display(
         for c, p in etf_prices.items()
         if p > 0
     )
+    vix_line = "  ".join(
+        f"[magenta]{ETF_NAME_MAP.get(c.split('.')[0], c)}-VIX[/magenta]="
+        f"{('[bold white]' + f'{vix_values[c]:.2f}' + '[/bold white]') if vix_values.get(c) is not None else '[dim]--[/dim]'}"
+        for c in _VIX_TARGETS
+    )
     n_profitable = sum(1 for s in all_display_signals if s.net_profit_estimate >= min_profit)
     header = Panel(
-        f"[bold bright_green]⚡ DeltaZero 套利监控[/bold bright_green]  "
+        f"[bold bright_green]⚡ DeltaZero 正向套利监控[/bold bright_green]  "
         f"[dim]{ts.strftime('%H:%M:%S')}[/dim]  第 {iteration} 次刷新\n"
         f"{etf_line}\n"
+        f"{vix_line}\n"
         f"[dim]监控配对: {n_pairs} 组  订阅期权: {n_option_codes} 个  "
         f"有报价: {len(all_display_signals)} 条  "
         f"[bold bright_green]正向机会 (≥{min_profit:.0f}元): {n_profitable}[/bold bright_green][/dim]",
@@ -312,7 +274,7 @@ def build_display(
         etf_px = etf_prices.get(u, 0.0)
         u_sigs = groups.get(u, [])
         display_sigs = select_display_pairs(u_sigs, etf_px, n_each_side) if u_sigs else []
-        tables.append(_build_etf_table(u, display_sigs, etf_px, min_profit))
+        tables.append(_build_etf_table(u, display_sigs, etf_px, min_profit, vix_values.get(u)))
 
     return RenderGroup(header, *tables)
 
@@ -337,9 +299,8 @@ def run_monitor(
     console.print("[green]OK[/green]")
 
     console.print("[bold]正在连接 Wind 终端...[/bold]", end=" ")
-    result = w.start()
-    if result.ErrorCode != 0:
-        console.print(f"[red]失败 (ErrorCode={result.ErrorCode})[/red]")
+    if not wind_connect(w, timeout=30, retries=3, delay_secs=2.0, logger=logging.getLogger(__name__)):
+        console.print("[red]失败（Wind 连接超时或重试耗尽）[/red]")
         return
     console.print("[green]连接成功[/green]")
 
@@ -360,7 +321,7 @@ def run_monitor(
     etf_snap = poll_snapshot(w, etf_codes, WIND_ETF_FIELDS)
     for code in etf_codes:
         q = etf_snap.get(code, {})
-        px = _fval(q, "RT_LAST", 0.0)
+        px = fval(q, "RT_LAST", 0.0)
         name = ETF_NAME_MAP.get(code.split(".")[0], code)
         if px > 0:
             etf_prices[code] = px
@@ -376,10 +337,20 @@ def run_monitor(
     iteration = 0
     last_signals: List[TradeSignal] = []
     etf_display: Dict[str, float] = dict(etf_prices)
+    vix_engine = VIXEngine(risk_free_rate=strategy.config.risk_free_rate)
+    vix_pairs, vix_option_codes = build_pairs_and_codes(
+        contract_mgr, active, etf_prices, atm_range_pct=10.0
+    )
+    option_codes = sorted(set(option_codes) | set(vix_option_codes))
+    vix_pairs_by_underlying: Dict[str, list] = {
+        u: [p for p in vix_pairs if p[0].underlying_code == u] for u in _VIX_TARGETS
+    }
+    vix_last: Dict[str, VIXResult] = {}
+    vix_display: Dict[str, Optional[float]] = {u: None for u in _VIX_TARGETS}
 
     def render() -> RenderGroup:
         return build_display(
-            last_signals, datetime.now(), etf_display,
+            last_signals, datetime.now(), etf_display, vix_display,
             len(pairs), len(option_codes), iteration, min_profit,
         )
 
@@ -389,18 +360,29 @@ def run_monitor(
                 ts = datetime.now()
                 etf_snap = poll_snapshot(w, etf_codes, WIND_ETF_FIELDS, cancel_before=True)
                 for code, q in etf_snap.items():
-                    tick = make_etf_tick(code, q, ts)
+                    tick = wind_row_to_etf_tick(code, q, ts)
                     if tick:
                         strategy.on_etf_tick(tick)
                         etf_display[code] = tick.price
 
                 opt_snap = poll_snapshot(w, option_codes, WIND_OPTION_FIELDS)
                 for code, q in opt_snap.items():
-                    tick = make_option_tick(code, q, ts)
+                    tick = wind_row_to_option_tick(code, q, ts)
                     if tick:
                         strategy.on_option_tick(tick)
 
                 last_signals = strategy.scan_pairs_for_display(pairs, current_time=ts)
+                for u in _VIX_TARGETS:
+                    result = vix_engine.compute_for_underlying(
+                        vix_pairs_by_underlying.get(u, []),
+                        strategy.aligner,
+                        ts,
+                        last_result=vix_last.get(u),
+                        enable_republication=True,
+                    )
+                    if result is not None:
+                        vix_last[u] = result
+                        vix_display[u] = result.vix
                 iteration += 1
                 live.update(render())
                 time.sleep(refresh_secs)
@@ -421,7 +403,7 @@ def run_monitor_zmq(
     refresh_secs: int = 3,
     atm_range_pct: float = 0.20,
     zmq_port: int = 5555,
-    snapshot_dir: str = r"D:\MARKET_DATA",
+    snapshot_dir: str = DEFAULT_MARKET_DATA_DIR,
 ) -> None:
     """ZMQ 订阅模式监控：从 data_recorder 进程接收实时行情。"""
     try:
@@ -474,10 +456,20 @@ def run_monitor_zmq(
     last_scan = datetime.now()
     last_signals: List[TradeSignal] = []
     etf_display = dict(etf_prices)
+    vix_engine = VIXEngine(risk_free_rate=strategy.config.risk_free_rate)
+    vix_pairs, vix_option_codes = build_pairs_and_codes(
+        contract_mgr, active, etf_prices, atm_range_pct=10.0
+    )
+    option_codes = sorted(set(option_codes) | set(vix_option_codes))
+    vix_pairs_by_underlying: Dict[str, list] = {
+        u: [p for p in vix_pairs if p[0].underlying_code == u] for u in _VIX_TARGETS
+    }
+    vix_last: Dict[str, VIXResult] = {}
+    vix_display: Dict[str, Optional[float]] = {u: None for u in _VIX_TARGETS}
 
     def render() -> RenderGroup:
         return build_display(
-            last_signals, datetime.now(), etf_display,
+            last_signals, datetime.now(), etf_display, vix_display,
             len(pairs), len(option_codes), iteration, min_profit,
         )
 
@@ -505,6 +497,17 @@ def run_monitor_zmq(
                 should_refresh = msgs_recv > 0 or (now - last_scan).total_seconds() >= refresh_secs
                 if should_refresh:
                     last_signals = strategy.scan_pairs_for_display(pairs, current_time=now)
+                    for u in _VIX_TARGETS:
+                        result = vix_engine.compute_for_underlying(
+                            vix_pairs_by_underlying.get(u, []),
+                            strategy.aligner,
+                            now,
+                            last_result=vix_last.get(u),
+                            enable_republication=True,
+                        )
+                        if result is not None:
+                            vix_last[u] = result
+                            vix_display[u] = result.vix
                     iteration += 1
                     last_scan = now
                     live.update(render())
@@ -523,7 +526,7 @@ def run_monitor_zmq(
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="DeltaZero — PCP 套利实时监控",
+        description="DeltaZero — PCP 正向套利实时监控",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 示例:
@@ -544,7 +547,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--refresh", type=int, default=3, help="刷新间隔（秒），ZMQ 模式收到新数据会立即刷新")
     parser.add_argument("--atm-range", type=float, default=0.20, help="ATM 距离过滤比例")
     parser.add_argument("--zmq-port", type=int, default=5555, help="ZMQ PUB 端口")
-    parser.add_argument("--snapshot-dir", type=str, default=r"D:\MARKET_DATA", help="快照文件目录")
+    parser.add_argument("--snapshot-dir", type=str, default=DEFAULT_MARKET_DATA_DIR, help="快照文件目录")
     return parser.parse_args()
 
 

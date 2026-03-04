@@ -331,6 +331,13 @@ class PCPArbitrage:
 
         best: Optional[TradeSignal] = None
 
+        # 异常值预警：单张净利超常理时标记，疑为乘数/行权价匹配错误
+        if abs(fwd_profit) > 2000 or abs(rev_profit) > 2000:
+            logger.warning(
+                "疑为计算异常: 正向净利=%.2f 元/张, 反向净利=%.2f 元/张 (Call=%s, K=%.4f, mult=%d)",
+                fwd_profit, rev_profit, call_info.contract_code, K, mult,
+            )
+
         if fwd_profit >= self.config.min_profit_threshold:
             best = TradeSignal(
                 timestamp=current_time,

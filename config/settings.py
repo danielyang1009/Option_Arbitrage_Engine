@@ -11,6 +11,21 @@ from dataclasses import dataclass, field
 from typing import Dict, List
 
 
+UNDERLYINGS: List[str] = [
+    "510050.SH",
+    "510300.SH",
+    "510500.SH",
+]
+
+ETF_CODE_TO_NAME: Dict[str, str] = {
+    "510050.SH": "50ETF",
+    "510300.SH": "300ETF",
+    "510500.SH": "500ETF",
+}
+
+DEFAULT_MARKET_DATA_DIR = r"D:\MARKET_DATA"
+
+
 @dataclass
 class FeeConfig:
     """
@@ -112,18 +127,14 @@ class RecorderConfig:
 
     控制 Wind 订阅品种、存储路径、分片写入间隔、ZMQ 发布端口等。
     """
-    products: List[str] = field(default_factory=lambda: [
-        "510050.SH",   # 50ETF
-        "510300.SH",   # 300ETF（华泰）
-        "510500.SH",   # 500ETF（南方）
-    ])
+    products: List[str] = field(default_factory=lambda: list(UNDERLYINGS))
 
     # Wind 订阅字段
     option_fields: str = "rt_last,rt_ask1,rt_bid1,rt_oi,rt_vol,rt_high,rt_low"
     etf_fields: str    = "rt_last,rt_ask1,rt_bid1"
 
     # 存储路径（统一为 D:\MARKET_DATA）
-    output_dir: str = r"D:\MARKET_DATA"
+    output_dir: str = DEFAULT_MARKET_DATA_DIR
 
     # ZeroMQ 发布端口
     zmq_port: int = 5555
