@@ -140,7 +140,8 @@ def process_info(proc: psutil.Process, kind: str) -> Dict[str, Any]:
     elif kind == "monitor":
         mp = arg_from_cmd(cmd, "--min-profit", "30")
         ed = arg_from_cmd(cmd, "--expiry-days", "90")
-        params = f"source=zmq profit≥{mp} expiry≤{ed}d"
+        nes = arg_from_cmd(cmd, "--n-each-side", "10")
+        params = f"source=zmq profit≥{mp} expiry≤{ed}d ATM上下各{nes}组"
         restart_args = [
             "--min-profit",
             mp,
@@ -148,8 +149,8 @@ def process_info(proc: psutil.Process, kind: str) -> Dict[str, Any]:
             ed,
             "--refresh",
             arg_from_cmd(cmd, "--refresh", "3"),
-            "--atm-range",
-            arg_from_cmd(cmd, "--atm-range", "0.20"),
+            "--n-each-side",
+            arg_from_cmd(cmd, "--n-each-side", "10"),
             "--zmq-port",
             arg_from_cmd(cmd, "--zmq-port", "5555"),
             "--snapshot-dir",

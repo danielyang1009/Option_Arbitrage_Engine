@@ -68,6 +68,8 @@ class ZMQPublisher:
             "last":       _safe_float(tick.current),
             "ask1":       _safe_float(tick.ask_prices[0]),
             "bid1":       _safe_float(tick.bid_prices[0]),
+            "askv1":      int(tick.ask_volumes[0]) if tick.ask_volumes else 0,
+            "bidv1":      int(tick.bid_volumes[0]) if tick.bid_volumes else 0,
             "oi":         tick.position,
             "vol":        tick.volume,
             "high":       _safe_float(tick.high),
@@ -87,6 +89,8 @@ class ZMQPublisher:
             "last": _safe_float(tick.price),
             "ask1": _safe_float(tick.ask_price),
             "bid1": _safe_float(tick.bid_price),
+            "askv1": int(tick.ask_volume),
+            "bidv1": int(tick.bid_volume),
         }
         self._send(f"ETF_{prefix}", msg)
 

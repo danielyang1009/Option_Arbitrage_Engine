@@ -100,6 +100,8 @@ class ETFTickData:
     volume: int = 0
     ask_price: float = math.nan # 卖一价
     bid_price: float = math.nan # 买一价
+    ask_volume: int = 0         # 卖一量（份）
+    bid_volume: int = 0         # 买一量（份）
     is_simulated: bool = False  # 标记是否为模拟数据
 
 
@@ -169,13 +171,24 @@ def normalize_code(code: str, target_suffix: str = ".SH") -> str:
     Returns:
         标准化后的代码，如 '10000001.SH'
     """
+    if code is None:
+        return ""
+    code = str(code).strip()
+    if not code:
+        return ""
+
     for src, dst in CODE_SUFFIX_MAP.items():
         if code.endswith(src):
             if dst == target_suffix:
                 return code.replace(src, dst)
-            else:
-                return code
-    return code
+            return code
+
+    # 已有交易所后缀（如 .SH/.SZ）则保持原样
+    if "." in code:
+        return code
+
+    # 纯数字等无后缀代码，补齐目标后缀，确保跨模块可对齐
+    return f"{code}{target_suffix}"
 
 
 @dataclass
@@ -246,6 +259,13 @@ class TradeSignal:
     multiplier: int = 10000     # 该合约的真实乘数（标准 10000，调整型可能为 10265 等）
     is_adjusted: bool = False   # 是否为分红调整型合约（乘数≠10000）
     calc_detail: str = ""       # 计算明细（人可读的盘口公式字符串）
+    max_qty: Optional[float] = None          # 瓶颈容量（可成交组数）
+    spread_ratio: Optional[float] = None     # 盘口价差率（取 Call/Put 最大）
+    obi_c: Optional[float] = None            # 订单流失衡度（Call 买一支撑，卖 Call）
+    obi_s: Optional[float] = None           # 订单流失衡度（ETF 卖一支撑，买 S）
+    obi_p: Optional[float] = None           # 订单流失衡度（Put 卖一支撑，买 Put）
+    net_1tick: Optional[float] = None       # 单 tick 压力测试净利润
+    tolerance: Optional[float] = None        # 容错空间（可承受 tick 数）
 
 
 # ============================================================

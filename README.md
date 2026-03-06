@@ -85,5 +85,31 @@ curve_20260305 = BoundedCubicSplineRate.from_cgb_daily(target_date=date(2026, 3,
 
 > `from_cgb_daily` 会校验文件内 `date` 列与指定日期一致；不一致或缺失时抛出异常，避免用错曲线。
 
+## 交易参数（Monitor 净利润计算）
+
+Monitor 展示的**净利润**为正向套利（买 ETF + 买 Put + 卖 Call）的预估利润，公式：
+
+```
+每股利润 = K - (S_ask + P_ask - C_bid)
+净利润   = 每股利润 × 乘数 - ETF手续费 - 期权双边手续费
+```
+
+| 符号 | 含义 |
+|------|------|
+| K | 行权价 |
+| S_ask | ETF 卖一价（买 ETF 的成交价） |
+| P_ask | Put 卖一价（买 Put 的成交价） |
+| C_bid | Call 买一价（卖 Call 的成交价） |
+| 乘数 | 合约单位（标准 10000，调整型如 10265） |
+
+### 费用扣除
+
+| 参数 | 默认值 | 说明 |
+|------|--------|------|
+| `etf_fee_rate` | 0.00020 | ETF 现货单边规费（含佣金+过户费，约万 2） |
+| `option_round_trip_fee` | 3.0 | 期权双边固定手续费（元） |
+
+配置位于 `config/settings.py` 的 `FeeConfig`，策略在 `strategies/pcp_arbitrage.py` 的 `_evaluate_pair_for_display` 中计算。
+
 不使用仓库根目录存储运行数据。
 

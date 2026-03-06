@@ -300,17 +300,14 @@ class DDESubscriber(DataProvider):
         while self._is_running:
             data = self._client.poll_data(self._routes)
             self._update_staleness(data)
-            fused_snapshot = self._snapshot_fused_map()
 
             ts = bj_now_naive()
             ts_ms = int(ts.timestamp() * 1000)
 
+            # 熔断时仍向队列/ZMQ 发送 tick，保证 Monitor 有数据可展示；交易侧用 is_trading_safe() 阻断
             for raw_code, row in data.items():
                 entry = self._routes.get(raw_code)
                 if not entry:
-                    continue
-                key = self._underlying_key(entry, raw_code)
-                if key and fused_snapshot.get(key, False):
                     continue
                 if entry.option_type == "ETF":
                     self._emit_etf_tick(entry, row, ts, ts_ms)
@@ -338,8 +335,14 @@ class DDESubscriber(DataProvider):
         askv1 = _i(row.get("ASKVOLUME1"))
         bidv1 = _i(row.get("BIDVOLUME1"))
 
-        if not _is_valid_price(last) or not _is_valid_price(ask1) or not _is_valid_price(bid1):
+        # 非交易时段 DDE 常出现 bid/ask 空值；只要 last 有效就继续下发，
+        # 并用 last 回退一档价，保证 Monitor 仍可见数据流。
+        if not _is_valid_price(last):
             return
+        if not _is_valid_price(ask1):
+            ask1 = last
+        if not _is_valid_price(bid1):
+            bid1 = last
 
         multiplier = self._code_multiplier.get(code, 10000)
         is_adjusted = code in self._code_is_adjusted
@@ -351,6 +354,8 @@ class DDESubscriber(DataProvider):
             "last": last,
             "ask1": ask1,
             "bid1": bid1,
+            "askv1": askv1,
+            "bidv1": bidv1,
             "oi": 0,
             "vol": 0,
             "high": last,
@@ -396,6 +401,8 @@ class DDESubscriber(DataProvider):
         last = _f(row.get("LASTPRICE"))
         ask1 = _f(row.get("ASKPRICE1"))
         bid1 = _f(row.get("BIDPRICE1"))
+        askv1 = _i(row.get("ASKVOLUME1"))
+        bidv1 = _i(row.get("BIDVOLUME1"))
         if not _is_valid_price(last):
             return
 
@@ -405,6 +412,8 @@ class DDESubscriber(DataProvider):
             "last": last,
             "ask1": ask1,
             "bid1": bid1,
+            "askv1": askv1,
+            "bidv1": bidv1,
         }
         tick_obj = ETFTickData(
             timestamp=ts,
@@ -412,6 +421,8 @@ class DDESubscriber(DataProvider):
             price=last,
             ask_price=ask1,
             bid_price=bid1,
+            ask_volume=askv1,
+            bid_volume=bidv1,
             is_simulated=False,
         )
         pkt = TickPacket(is_etf=True, tick_row=tick_row, tick_obj=tick_obj, underlying_code=code)

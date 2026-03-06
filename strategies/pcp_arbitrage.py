@@ -92,6 +92,20 @@ class TickAligner:
             return None
         return quote.bid_price if not math.isnan(quote.bid_price) else quote.price
 
+    def get_etf_ask_volume(self, underlying_code: Optional[str] = None) -> Optional[int]:
+        """获取 ETF 卖一量（份），未知时返回 None。"""
+        quote = self._get_etf_quote(underlying_code)
+        if quote is None:
+            return None
+        return int(quote.ask_volume) if quote.ask_volume > 0 else None
+
+    def get_etf_bid_volume(self, underlying_code: Optional[str] = None) -> Optional[int]:
+        """获取 ETF 买一量（份），未知时返回 None。"""
+        quote = self._get_etf_quote(underlying_code)
+        if quote is None:
+            return None
+        return int(quote.bid_volume) if quote.bid_volume > 0 else None
+
     def reset(self) -> None:
         """清空所有快照"""
         self.latest_option_quotes.clear()
@@ -122,6 +136,83 @@ class PCPArbitrage:
         self.config = config
         self.aligner = TickAligner()
         self.signal_count: int = 0
+
+    @staticmethod
+    def _safe_level1_volume(level1: List[int]) -> int:
+        if not level1:
+            return 0
+        try:
+            return max(int(level1[0]), 0)
+        except Exception:
+            return 0
+
+    def _compute_forward_metrics(
+        self,
+        *,
+        K: float,
+        mult: int,
+        S_ask: float,
+        C_bid: float,
+        C_ask: float,
+        P_bid: float,
+        P_ask: float,
+        etf_fee_rate: float,
+        option_rt_fee: float,
+        c_bid_vol: int,
+        c_ask_vol: int,
+        p_bid_vol: int,
+        p_ask_vol: int,
+        s_bid_vol: Optional[int],
+        s_ask_vol: Optional[int],
+    ) -> Dict[str, Optional[float]]:
+        """计算正向套利净利与流动性/滑点指标。"""
+        fwd_per_share = K - (S_ask + P_ask - C_bid)
+        fwd_etf_fee = S_ask * mult * etf_fee_rate
+        fwd_profit = fwd_per_share * mult - fwd_etf_fee - option_rt_fee
+
+        c_mid = (C_ask + C_bid) / 2.0 if (C_ask + C_bid) > 0 else math.nan
+        p_mid = (P_ask + P_bid) / 2.0 if (P_ask + P_bid) > 0 else math.nan
+        c_spread = (C_ask - C_bid) / c_mid if c_mid > 0 else math.nan
+        p_spread = (P_ask - P_bid) / p_mid if p_mid > 0 else math.nan
+        spread_candidates = [x for x in [c_spread, p_spread] if math.isfinite(x) and x >= 0]
+        spread_ratio = max(spread_candidates) if spread_candidates else None
+
+        # OBI：订单流失衡度。正向套利：卖 Call（需买一支撑）、买 S（需卖一支撑）、买 Put（需卖一支撑）
+        denom_c = c_bid_vol + c_ask_vol
+        obi_c = (c_bid_vol / denom_c) if denom_c > 0 else None
+        denom_s = (s_ask_vol or 0) + (s_bid_vol or 0)
+        obi_s = (s_ask_vol / denom_s) if (s_ask_vol is not None and s_ask_vol > 0 and s_bid_vol is not None and denom_s > 0) else None
+        denom_p = p_bid_vol + p_ask_vol
+        obi_p = (p_ask_vol / denom_p) if denom_p > 0 else None
+
+        # ETF 一档量在部分数据源不可得，缺失时 max_qty 返回 None（由展示层显示为 --）
+        # 交易软件显示买量/卖量为手（1手=100股），需转换为期权张数并向下取整
+        max_qty = None
+        if s_ask_vol is not None and s_ask_vol > 0 and mult > 0 and c_bid_vol > 0 and p_ask_vol > 0:
+            s_contracts = math.floor(s_ask_vol * 100 / mult)
+            max_qty = min(float(c_bid_vol), float(p_ask_vol), float(s_contracts))
+
+        # 单 tick 最坏滑点：ETF +0.001，Put +0.0001，Call -0.0001
+        S_ask_1tick = S_ask + 0.001
+        P_ask_1tick = P_ask + 0.0001
+        C_bid_1tick = max(C_bid - 0.0001, 0.0)
+        fwd_per_share_1tick = K - (S_ask_1tick + P_ask_1tick - C_bid_1tick)
+        fwd_etf_fee_1tick = S_ask_1tick * mult * etf_fee_rate
+        net_1tick = fwd_per_share_1tick * mult - fwd_etf_fee_1tick - option_rt_fee
+        tick_loss = fwd_profit - net_1tick
+        tolerance = (fwd_profit / tick_loss) if tick_loss > 0 else None
+
+        return {
+            "fwd_per_share": fwd_per_share,
+            "fwd_profit": fwd_profit,
+            "net_1tick": net_1tick,
+            "max_qty": max_qty,
+            "spread_ratio": spread_ratio,
+            "obi_c": obi_c,
+            "obi_s": obi_s,
+            "obi_p": obi_p,
+            "tolerance": tolerance,
+        }
 
     def on_option_tick(self, tick: TickData) -> None:
         """接收期权 Tick 更新"""
@@ -189,13 +280,31 @@ class PCPArbitrage:
 
         _s_ask = self.aligner.get_etf_ask(underlying)
         S_ask = _s_ask if _s_ask is not None else etf_price
+        s_ask_vol = self.aligner.get_etf_ask_volume(underlying)
+        s_bid_vol = self.aligner.get_etf_bid_volume(underlying)
 
         etf_fee_rate   = self.config.etf_fee_rate
         option_rt_fee  = self.config.option_round_trip_fee
 
-        fwd_per_share = K - (S_ask + P_ask - C_bid)
-        fwd_etf_fee   = S_ask * mult * etf_fee_rate
-        fwd_profit    = fwd_per_share * mult - fwd_etf_fee - option_rt_fee
+        metrics = self._compute_forward_metrics(
+            K=K,
+            mult=mult,
+            S_ask=S_ask,
+            C_bid=C_bid,
+            C_ask=C_ask,
+            P_bid=P_bid,
+            P_ask=P_ask,
+            etf_fee_rate=etf_fee_rate,
+            option_rt_fee=option_rt_fee,
+            c_bid_vol=self._safe_level1_volume(call_tick.bid_volumes),
+            c_ask_vol=self._safe_level1_volume(call_tick.ask_volumes),
+            p_bid_vol=self._safe_level1_volume(put_tick.bid_volumes),
+            p_ask_vol=self._safe_level1_volume(put_tick.ask_volumes),
+            s_bid_vol=s_bid_vol,
+            s_ask_vol=s_ask_vol,
+        )
+        fwd_per_share = float(metrics["fwd_per_share"] or 0.0)
+        fwd_profit = float(metrics["fwd_profit"] or 0.0)
         fwd_detail    = (
             f"K({K:.3g})-S_a({S_ask:.4f})-P_a({P_ask:.4f})+C_b({C_bid:.4f})"
             f"={fwd_per_share:.4f}/股"
@@ -220,6 +329,13 @@ class PCPArbitrage:
             multiplier=mult,
             is_adjusted=call_info.is_adjusted,
             calc_detail=fwd_detail,
+            max_qty=metrics["max_qty"],
+            spread_ratio=metrics["spread_ratio"],
+            obi_c=metrics["obi_c"],
+            obi_s=metrics["obi_s"],
+            obi_p=metrics["obi_p"],
+            net_1tick=metrics["net_1tick"],
+            tolerance=metrics["tolerance"],
         )
 
     def scan_opportunities(
@@ -306,15 +422,33 @@ class PCPArbitrage:
         S_ask = _s_ask if _s_ask is not None else etf_price
         _s_bid = self.aligner.get_etf_bid(underlying)
         S_bid = _s_bid if _s_bid is not None else etf_price
+        s_ask_vol = self.aligner.get_etf_ask_volume(underlying)
+        s_bid_vol = self.aligner.get_etf_bid_volume(underlying)
 
         etf_fee_rate        = self.config.etf_fee_rate
         option_rt_fee       = self.config.option_round_trip_fee
         theoretical_spread  = etf_price - K * math.exp(-r * T)
 
         # ── 正向套利（Forward）：买现货 + 买Put + 卖Call ─────────
-        fwd_per_share  = K - (S_ask + P_ask - C_bid)
-        fwd_etf_fee    = S_ask * mult * etf_fee_rate
-        fwd_profit     = fwd_per_share * mult - fwd_etf_fee - option_rt_fee
+        metrics = self._compute_forward_metrics(
+            K=K,
+            mult=mult,
+            S_ask=S_ask,
+            C_bid=C_bid,
+            C_ask=C_ask,
+            P_bid=P_bid,
+            P_ask=P_ask,
+            etf_fee_rate=etf_fee_rate,
+            option_rt_fee=option_rt_fee,
+            c_bid_vol=self._safe_level1_volume(call_tick.bid_volumes),
+            c_ask_vol=self._safe_level1_volume(call_tick.ask_volumes),
+            p_bid_vol=self._safe_level1_volume(put_tick.bid_volumes),
+            p_ask_vol=self._safe_level1_volume(put_tick.ask_volumes),
+            s_bid_vol=s_bid_vol,
+            s_ask_vol=s_ask_vol,
+        )
+        fwd_per_share = float(metrics["fwd_per_share"] or 0.0)
+        fwd_profit = float(metrics["fwd_profit"] or 0.0)
         fwd_detail     = (
             f"K({K:.3g})-S_a({S_ask:.4f})-P_a({P_ask:.4f})+C_b({C_bid:.4f})"
             f"={fwd_per_share:.4f}/股"
@@ -357,6 +491,13 @@ class PCPArbitrage:
                 multiplier=mult,
                 is_adjusted=call_info.is_adjusted,
                 calc_detail=fwd_detail,
+                max_qty=metrics["max_qty"],
+                spread_ratio=metrics["spread_ratio"],
+                obi_c=metrics["obi_c"],
+                obi_s=metrics["obi_s"],
+                obi_p=metrics["obi_p"],
+                net_1tick=metrics["net_1tick"],
+                tolerance=metrics["tolerance"],
             )
 
         if self.config.enable_reverse and rev_profit >= self.config.min_profit_threshold:
@@ -379,6 +520,13 @@ class PCPArbitrage:
                     multiplier=mult,
                     is_adjusted=call_info.is_adjusted,
                     calc_detail=rev_detail,
+                    max_qty=metrics["max_qty"],
+                    spread_ratio=metrics["spread_ratio"],
+                    obi_c=metrics["obi_c"],
+                    obi_s=metrics["obi_s"],
+                    obi_p=metrics["obi_p"],
+                    net_1tick=metrics["net_1tick"],
+                    tolerance=metrics["tolerance"],
                 )
 
         return best

@@ -47,9 +47,9 @@ def wind_row_to_option_tick(code: str, row: dict, ts: datetime) -> Optional[Tick
         money=0.0,
         position=ival(row, "RT_OI"),
         ask_prices=[float(ask1)] + [math.nan] * 4,
-        ask_volumes=[100] + [0] * 4,
+        ask_volumes=[0] + [0] * 4,
         bid_prices=[float(bid1)] + [math.nan] * 4,
-        bid_volumes=[100] + [0] * 4,
+        bid_volumes=[0] + [0] * 4,
     )
 
 
@@ -63,6 +63,8 @@ def wind_row_to_etf_tick(code: str, row: dict, ts: datetime) -> Optional[ETFTick
         price=float(last),
         ask_price=float(fval(row, "RT_ASK1")),
         bid_price=float(fval(row, "RT_BID1")),
+        ask_volume=0,
+        bid_volume=0,
         is_simulated=False,
     )
 
@@ -78,6 +80,8 @@ def wind_row_to_option_tick_row(code: str, underlying: str, row: dict, ts: datet
         "last": float(tick.current),
         "ask1": float(tick.ask_prices[0]),
         "bid1": float(tick.bid_prices[0]),
+        "askv1": int(tick.ask_volumes[0]),
+        "bidv1": int(tick.bid_volumes[0]),
         "oi": int(tick.position),
         "vol": int(tick.volume),
         "high": float(tick.high),
@@ -95,6 +99,8 @@ def wind_row_to_etf_tick_row(code: str, row: dict, ts: datetime) -> Optional[dic
         "last": float(tick.price),
         "ask1": float(tick.ask_price),
         "bid1": float(tick.bid_price),
+        "askv1": int(tick.ask_volume),
+        "bidv1": int(tick.bid_volume),
     }
 
 

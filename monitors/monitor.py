@@ -17,7 +17,7 @@ import time
 from collections import defaultdict
 from datetime import date, datetime
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 # Windows UTF-8 修复必须在 rich 之前
 from monitors.common import fix_windows_encoding
@@ -43,10 +43,12 @@ from monitors.common import (
 )
 from config.settings import DEFAULT_MARKET_DATA_DIR, UNDERLYINGS
 from models import (
+    ContractInfo,
     ETFTickData,
     TradeSignal,
 )
 from calculators.vix_engine import VIXEngine, VIXResult
+from calculators.yield_curve import BoundedCubicSplineRate
 from strategies.pcp_arbitrage import PCPArbitrage
 
 console = Console(legacy_windows=False, highlight=True)
@@ -78,24 +80,34 @@ def _build_etf_table(
     price: float,
     min_profit: float,
     vix_value: Optional[float] = None,
+    *,
+    n_pairs: int = 0,
+    n_opts: int = 0,
+    n_positive: int = 0,
+    n_profitable: int = 0,
 ) -> Table:
-    """为单个品种构建信号表格（固定显示 ATM 上下各 10 行）"""
+    """为单个品种构建信号表格（固定显示 ATM 上下各 n_each_side 行）"""
     u_name = ETF_NAME_MAP.get(underlying.split(".")[0], underlying)
-    n_profitable = sum(1 for s in sigs if s.net_profit_estimate >= min_profit)
-    border = "bright_green" if n_profitable > 0 else (_ETF_BORDER.get(underlying, "dim") if sigs else "dim")
+    n_profitable_val = sum(1 for s in sigs if s.net_profit_estimate >= min_profit)
+    border = "bright_green" if n_profitable_val > 0 else (_ETF_BORDER.get(underlying, "dim") if sigs else "dim")
 
-    title_parts = [f"[bold]{u_name}[/bold]"]
+    # 第一行：品种名、价格、VIX
+    line1 = [f"[bold]{u_name}[/bold]"]
     if price > 0:
-        title_parts.append(f"[yellow]{price:.4f}[/yellow]")
+        line1.append(f"[yellow]{price:.4f}[/yellow]")
     if vix_value is not None:
-        title_parts.append(f"[magenta]VIX {vix_value:.2f}[/magenta]")
-    if n_profitable > 0:
-        title_parts.append(f"[bold bright_green]正向 {n_profitable} 条[/bold bright_green]")
+        line1.append(f"[magenta]VIX {vix_value:.2f}[/magenta]")
     if not sigs:
-        title_parts.append("[dim]暂无数据[/dim]")
+        line1.append("[dim]暂无数据[/dim]")
+
+    # 第二行：监控配对、订阅期权、有效报价、正向机会(≥0)、高价值(≥min_profit)
+    line2 = (
+        f"[dim]监控配对: {n_pairs} 组  订阅期权: {n_opts} 个  "
+        f"有报价: {len(sigs)} 条  正向机会: {n_positive}  (≥{min_profit:.0f}元: {n_profitable})[/dim]"
+    )
 
     tbl = Table(
-        title="  ".join(title_parts),
+        title="  ".join(line1) + "\n" + line2,
         box=box.SIMPLE_HEAVY,
         show_header=True,
         header_style="bold cyan",
@@ -104,19 +116,23 @@ def _build_etf_table(
         padding=(0, 1),
     )
     tbl.add_column("到期",   style="dim", width=5,  justify="center")
-    tbl.add_column("行权价",             width=8,  justify="left")
+    tbl.add_column("行权价",             width=6,  justify="left")
     tbl.add_column("方向",               width=4,  justify="center")
-    tbl.add_column("净利润",             width=8,  justify="right")
-    tbl.add_column("乘数",               width=6,  justify="right")
+    tbl.add_column("净利润",             width=7,  justify="right")
+    tbl.add_column("Max_Qty",           width=6,  justify="right")
+    tbl.add_column("SPRD",              width=5,  justify="right")
+    tbl.add_column("OBI_C",             width=5,  justify="right")
+    tbl.add_column("OBI_S",             width=5,  justify="right")
+    tbl.add_column("OBI_P",             width=5,  justify="right")
+    tbl.add_column("Net_1T",           width=7,  justify="right")
+    tbl.add_column("TOL",              width=6,  justify="right")
     tbl.add_column("C_b",               width=7,  justify="right")
-    tbl.add_column("C_a",               width=7,  justify="right")
-    tbl.add_column("P_b",               width=7,  justify="right")
     tbl.add_column("P_a",               width=7,  justify="right")
     tbl.add_column("S",                 width=7,  justify="right")
-    tbl.add_column("明细",   style="dim", min_width=30)
+    tbl.add_column("乘数",               width=6,  justify="right")
 
     if not sigs:
-        tbl.add_row(*["—"] * 9, "[dim]暂无数据[/dim]", "—")
+        tbl.add_row(*["—"] * 15)
         return tbl
 
     def _add_sig_row(sig: TradeSignal) -> None:
@@ -134,6 +150,27 @@ def _build_etf_table(
             dir_str = ""
 
         mult_str = str(sig.multiplier)
+        max_qty_str = f"{sig.max_qty:.2f}" if sig.max_qty is not None else "--"
+        spread_str = f"{sig.spread_ratio * 100:.1f}%" if sig.spread_ratio is not None else "--"
+        obi_c_str = f"{sig.obi_c:.2f}" if sig.obi_c is not None else "--"
+        obi_s_str = f"{sig.obi_s:.2f}" if sig.obi_s is not None else "--"
+        obi_p_str = f"{sig.obi_p:.2f}" if sig.obi_p is not None else "--"
+        net_1tick_str = f"{sig.net_1tick:.0f}" if sig.net_1tick is not None else "--"
+        tolerance_str = f"{sig.tolerance:.2f}" if sig.tolerance is not None else "--"
+
+        risk_gray = (
+            (sig.max_qty is not None and sig.max_qty < 5)
+            or (sig.spread_ratio is not None and sig.spread_ratio > 0.10)
+            or (sig.tolerance is not None and sig.tolerance < 3.0)
+            or (sig.obi_c is not None and sig.obi_c < 0.2)
+            or (sig.obi_s is not None and sig.obi_s < 0.2)
+            or (sig.obi_p is not None and sig.obi_p < 0.2)
+        )
+        risk_red = (
+            (sig.spread_ratio is not None and sig.spread_ratio > 0.10)
+            or (sig.tolerance is not None and sig.tolerance < 1.0)
+        )
+        row_style = "black on bright_red" if risk_red else ("dim" if risk_gray else None)
 
         adj_tag = " [dim]A[/dim]" if is_adj else ""
         strike_str = f"{sig.strike:.2f}{adj_tag}"
@@ -143,13 +180,18 @@ def _build_etf_table(
             strike_str,
             dir_str,
             profit_str,
-            mult_str,
+            max_qty_str,
+            spread_str,
+            obi_c_str,
+            obi_s_str,
+            obi_p_str,
+            net_1tick_str,
+            tolerance_str,
             f"{sig.call_bid:.4f}",
-            f"{sig.call_ask:.4f}",
-            f"{sig.put_bid:.4f}",
             f"{sig.put_ask:.4f}",
             f"{sig.spot_price:.4f}",
-            sig.calc_detail,
+            mult_str,
+            style=row_style,
         )
 
     by_expiry: Dict[date, List[TradeSignal]] = defaultdict(list)
@@ -181,32 +223,16 @@ def build_display(
     ts: datetime,
     etf_prices: Dict[str, float],
     vix_values: Dict[str, Optional[float]],
-    n_pairs: int,
-    n_option_codes: int,
+    pairs_for_scan: List[Tuple[ContractInfo, ContractInfo]],
     iteration: int,
     min_profit: float,
     n_each_side: int = 10,
+    no_data_hint: Optional[str] = None,
 ) -> RenderGroup:
     """构建套利信号布局，按品种分块显示（每品种固定 ATM 上下各 n_each_side 行）"""
-    etf_line = "  ".join(
-        f"[cyan]{ETF_NAME_MAP.get(c.split('.')[0], c)}[/cyan]=[bold yellow]{p:.4f}[/bold yellow]"
-        for c, p in etf_prices.items()
-        if p > 0
-    )
-    vix_line = "  ".join(
-        f"[magenta]{ETF_NAME_MAP.get(c.split('.')[0], c)}-VIX[/magenta]="
-        f"{('[bold white]' + f'{vix_values[c]:.2f}' + '[/bold white]') if vix_values.get(c) is not None else '[dim]--[/dim]'}"
-        for c in _VIX_TARGETS
-    )
-    n_profitable = sum(1 for s in all_display_signals if s.net_profit_estimate >= min_profit)
     header = Panel(
         f"[bold bright_green]⚡ DeltaZero 正向套利监控[/bold bright_green]  "
-        f"[dim]{ts.strftime('%H:%M:%S')}[/dim]  第 {iteration} 次刷新\n"
-        f"{etf_line}\n"
-        f"{vix_line}\n"
-        f"[dim]监控配对: {n_pairs} 组  订阅期权: {n_option_codes} 个  "
-        f"有报价: {len(all_display_signals)} 条  "
-        f"[bold bright_green]正向机会 (≥{min_profit:.0f}元): {n_profitable}[/bold bright_green][/dim]",
+        f"[dim]{ts.strftime('%H:%M:%S')}[/dim]  第 {iteration} 次刷新",
         box=box.MINIMAL,
         padding=(0, 2),
     )
@@ -222,8 +248,22 @@ def build_display(
         etf_px = etf_prices.get(u, 0.0)
         u_sigs = groups.get(u, [])
         display_sigs = select_display_pairs(u_sigs, etf_px, n_each_side) if u_sigs else []
-        tables.append(_build_etf_table(u, display_sigs, etf_px, min_profit, vix_values.get(u)))
+        # 第二行统计均在显示范围内（ATM 上下各 n_each_side），与表格内容一致
+        n_pairs_u = len(display_sigs)  # 显示配对 = 表格行数
+        n_opts_u = 2 * len(display_sigs)  # 每配对 2 个期权（Call+Put）
+        n_positive_u = sum(1 for s in display_sigs if s.net_profit_estimate >= 0)
+        n_profitable_u = sum(1 for s in display_sigs if s.net_profit_estimate >= min_profit)
+        tables.append(
+            _build_etf_table(
+                u, display_sigs, etf_px, min_profit, vix_values.get(u),
+                n_pairs=n_pairs_u, n_opts=n_opts_u,
+                n_positive=n_positive_u, n_profitable=n_profitable_u,
+            )
+        )
 
+    if no_data_hint:
+        warn_panel = Panel(no_data_hint, title="[yellow]提示[/yellow]", border_style="yellow")
+        return RenderGroup(warn_panel, header, *tables)
     return RenderGroup(header, *tables)
 
 
@@ -235,7 +275,7 @@ def run_monitor(
     min_profit: float = 30.0,
     expiry_days: int = 90,
     refresh_secs: int = 3,
-    atm_range_pct: float = 0.20,
+    n_each_side: int = 10,
     zmq_port: int = 5555,
     snapshot_dir: str = DEFAULT_MARKET_DATA_DIR,
 ) -> None:
@@ -263,7 +303,7 @@ def run_monitor(
     try:
         strategy, contract_mgr, active, pairs, option_codes, etf_codes = (
             init_strategy_and_contracts(
-                min_profit, expiry_days, atm_range_pct, etf_prices,
+                min_profit, expiry_days, 1.0, etf_prices,  # 1.0=全量配对，显示由 n_each_side 控制
                 log_fn=lambda msg: console.print(msg),
             )
         )
@@ -277,7 +317,8 @@ def run_monitor(
     ctx = zmq.Context.instance()
     sock = ctx.socket(zmq.SUB)
     sock.connect(f"tcp://127.0.0.1:{zmq_port}")
-    sock.setsockopt_string(zmq.SUBSCRIBE, "")
+    sock.setsockopt_string(zmq.SUBSCRIBE, "OPT_")
+    sock.setsockopt_string(zmq.SUBSCRIBE, "ETF_")
     sock.setsockopt(zmq.RCVTIMEO, 100)
 
     console.print(
@@ -290,11 +331,21 @@ def run_monitor(
     last_scan = datetime.now()
     last_signals: List[TradeSignal] = []
     etf_display = dict(etf_prices)
+    no_data_cycles = 0  # 连续未收到 ZMQ 消息的刷新次数
     # 仅展示“当前实时流里出现过”的标的，避免历史快照把未订阅品种带出来
     stream_underlyings: set[str] = set()
-    vix_engine = VIXEngine(risk_free_rate=strategy.config.risk_free_rate)
+    try:
+        yield_curve = BoundedCubicSplineRate.from_cgb_daily(
+            base_dir=DEFAULT_MARKET_DATA_DIR,
+            require_exists=True,
+        )
+        vix_engine = VIXEngine(risk_free_rate=yield_curve)
+        console.print("[dim]VIX 使用插值国债收益率曲线[/dim]")
+    except FileNotFoundError:
+        vix_engine = VIXEngine(risk_free_rate=strategy.config.risk_free_rate)
+        console.print("[yellow]未找到中债曲线，VIX 使用固定利率 {:.2%}[/yellow]".format(strategy.config.risk_free_rate))
     vix_pairs, vix_option_codes = build_pairs_and_codes(
-        contract_mgr, active, etf_prices, atm_range_pct=10.0
+        contract_mgr, active, etf_prices, atm_range_pct=1.0
     )
     option_codes = sorted(set(option_codes) | set(vix_option_codes))
     vix_pairs_by_underlying: Dict[str, list] = {
@@ -306,7 +357,7 @@ def run_monitor(
     def render() -> RenderGroup:
         return build_display(
             last_signals, datetime.now(), etf_display, vix_display,
-            len(pairs), len(option_codes), iteration, min_profit,
+            pairs, iteration, min_profit,
         )
 
     try:
@@ -333,6 +384,10 @@ def run_monitor(
                     msgs_recv += 1
 
                 now = datetime.now()
+                if msgs_recv == 0:
+                    no_data_cycles += 1
+                else:
+                    no_data_cycles = 0
                 # 收到新数据即刷新；无数据时按 refresh_secs 周期刷新
                 should_refresh = msgs_recv > 0 or (now - last_scan).total_seconds() >= refresh_secs
                 if should_refresh:
@@ -358,10 +413,20 @@ def run_monitor(
                             vix_display[u] = result.vix
                     iteration += 1
                     last_scan = now
+                    # 订阅期权 = 当前扫描配对中的期权合约数（与监控配对一致）
+                    n_opts_scan = len({c.contract_code for p in pairs_for_scan for c in p})
+                    no_data_hint: Optional[str] = None
+                    if no_data_cycles >= 5 and not stream_underlyings:
+                        no_data_hint = (
+                            f"未收到 ZMQ 数据，请确认：1) 已先启动 DataBus（DDE 或 Wind）；"
+                            f"2) ZMQ 端口与 DataBus 一致（当前 {zmq_port}）；3) 若为 DDE，交易软件已打开且 DDE 有数据。"
+                        )
                     def render_filtered() -> RenderGroup:
                         return build_display(
                             last_signals, datetime.now(), etf_display_view, vix_display,
-                            len(pairs_for_scan), len(option_codes), iteration, min_profit,
+                            pairs_for_scan, iteration, min_profit,
+                            n_each_side=n_each_side,
+                            no_data_hint=no_data_hint,
                         )
                     live.update(render_filtered())
 
@@ -386,6 +451,7 @@ def parse_args() -> argparse.Namespace:
   python monitor.py                          # 从 data_bus 进程读取
   python monitor.py --min-profit 150         # 净利润阈值
   python monitor.py --expiry-days 30         # 只看近月合约
+  python monitor.py --n-each-side 0          # 显示全部监控期权（0=不限制）
   python monitor.py --refresh 3              # 每3秒刷新
   python monitor.py --zmq-port 5556
 """,
@@ -393,7 +459,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--min-profit", type=float, default=30.0, help="最小显示净利润（元/组）")
     parser.add_argument("--expiry-days", type=int, default=90, help="最大到期天数")
     parser.add_argument("--refresh", type=int, default=3, help="刷新间隔（秒），收到新数据会立即刷新")
-    parser.add_argument("--atm-range", type=float, default=0.20, help="ATM 距离过滤比例")
+    parser.add_argument("--n-each-side", type=int, default=10, help="ATM 上下各显示 N 组（0=显示全部）")
     parser.add_argument("--zmq-port", type=int, default=5555, help="ZMQ PUB 端口")
     parser.add_argument("--snapshot-dir", type=str, default=DEFAULT_MARKET_DATA_DIR, help="快照文件目录")
     return parser.parse_args()
@@ -405,7 +471,7 @@ if __name__ == "__main__":
         min_profit=args.min_profit,
         expiry_days=args.expiry_days,
         refresh_secs=args.refresh,
-        atm_range_pct=args.atm_range,
+        n_each_side=args.n_each_side,
         zmq_port=args.zmq_port,
         snapshot_dir=args.snapshot_dir,
     )

@@ -63,6 +63,8 @@ def _get_option_schema():
         pa.field("last",        pa.float32()),
         pa.field("ask1",        pa.float32()),
         pa.field("bid1",        pa.float32()),
+        pa.field("askv1",       pa.int32()),
+        pa.field("bidv1",       pa.int32()),
         pa.field("oi",          pa.int32()),
         pa.field("vol",         pa.int32()),
         pa.field("high",        pa.float32()),
@@ -79,6 +81,8 @@ def _get_etf_schema():
         pa.field("last", pa.float32()),
         pa.field("ask1", pa.float32()),
         pa.field("bid1", pa.float32()),
+        pa.field("askv1", pa.int32()),
+        pa.field("bidv1", pa.int32()),
     ])
 
 def _get_snapshot_schema():
@@ -91,6 +95,8 @@ def _get_snapshot_schema():
         pa.field("last",        pa.float32()),
         pa.field("ask1",        pa.float32()),
         pa.field("bid1",        pa.float32()),
+        pa.field("askv1",       pa.int32()),
+        pa.field("bidv1",       pa.int32()),
         pa.field("oi",          pa.int32()),
         pa.field("vol",         pa.int32()),
         pa.field("high",        pa.float32()),
@@ -160,6 +166,8 @@ class ParquetWriter:
                 **tick_row,
                 "type":        "etf",
                 "underlying":  tick_row["code"],
+                "askv1":       0,
+                "bidv1":       0,
                 "oi":          0,
                 "vol":         0,
                 "high":        tick_row.get("last", 0.0),
@@ -336,6 +344,18 @@ def _nan_to_none(v: Any) -> Any:
     return v
 
 
+def _int_or_zero(v: Any) -> int:
+    try:
+        if v is None:
+            return 0
+        f = float(v)
+        if math.isnan(f):
+            return 0
+        return int(round(f))
+    except Exception:
+        return 0
+
+
 def _write_rows(rows: List[Dict], path: Path, schema, row_to_arrays_fn) -> None:
     """将 dict 列表写入一个完整的 Parquet 文件"""
     import pyarrow as pa
@@ -353,6 +373,8 @@ def _option_row_to_arrays(rows: List[Dict]) -> Dict[str, list]:
         "last":        [_nan_to_none(r.get("last"))  for r in rows],
         "ask1":        [_nan_to_none(r.get("ask1"))  for r in rows],
         "bid1":        [_nan_to_none(r.get("bid1"))  for r in rows],
+        "askv1":       [_int_or_zero(r.get("askv1", 0))  for r in rows],
+        "bidv1":       [_int_or_zero(r.get("bidv1", 0))  for r in rows],
         "oi":          [r.get("oi",  0) for r in rows],
         "vol":         [r.get("vol", 0) for r in rows],
         "high":        [_nan_to_none(r.get("high")) for r in rows],
@@ -369,6 +391,8 @@ def _etf_row_to_arrays(rows: List[Dict]) -> Dict[str, list]:
         "last": [_nan_to_none(r.get("last")) for r in rows],
         "ask1": [_nan_to_none(r.get("ask1")) for r in rows],
         "bid1": [_nan_to_none(r.get("bid1")) for r in rows],
+        "askv1": [_int_or_zero(r.get("askv1", 0)) for r in rows],
+        "bidv1": [_int_or_zero(r.get("bidv1", 0)) for r in rows],
     }
 
 
@@ -381,6 +405,8 @@ def _snapshot_row_to_arrays(rows: List[Dict]) -> Dict[str, list]:
         "last":        [_nan_to_none(r.get("last"))    for r in rows],
         "ask1":        [_nan_to_none(r.get("ask1"))    for r in rows],
         "bid1":        [_nan_to_none(r.get("bid1"))    for r in rows],
+        "askv1":       [_int_or_zero(r.get("askv1", 0)) for r in rows],
+        "bidv1":       [_int_or_zero(r.get("bidv1", 0)) for r in rows],
         "oi":          [r.get("oi",  0)                for r in rows],
         "vol":         [r.get("vol", 0)                for r in rows],
         "high":        [_nan_to_none(r.get("high"))    for r in rows],

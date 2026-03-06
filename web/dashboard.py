@@ -187,6 +187,42 @@ def _wxy_50etf_mtime_ago() -> str:
     return f"{int(delta // 86400)}天前"
 
 
+def _mtime_ago_str(mtime: float) -> str:
+    """将 mtime 转为距今描述。"""
+    delta = time.time() - mtime
+    if delta < 60:
+        return "刚刚"
+    if delta < 3600:
+        return f"{int(delta // 60)}分钟前"
+    if delta < 86400:
+        return f"{int(delta // 3600)}小时前"
+    return f"{int(delta // 86400)}天前"
+
+
+def _bond_files_info() -> Dict[str, Dict[str, Any]]:
+    """返回 cgb_yieldcurve 与 shibor_yieldcurve 最新文件信息。"""
+    base = Path(DEFAULT_MARKET_DATA_DIR)
+    result: Dict[str, Dict[str, Any]] = {
+        "cgb_yieldcurve": {"name": None, "mtime_ago": "文件不存在"},
+        "shibor_yieldcurve": {"name": None, "mtime_ago": "文件不存在"},
+    }
+    for key, subdir, pattern in [
+        ("cgb_yieldcurve", "macro/cgb_yield", "cgb_yieldcurve_*.csv"),
+        ("shibor_yieldcurve", "macro/shibor", "shibor_yieldcurve_*.csv"),
+    ]:
+        dir_path = base / subdir
+        if not dir_path.exists():
+            continue
+        files = sorted(dir_path.glob(pattern), key=lambda p: p.stat().st_mtime, reverse=True)
+        if files:
+            latest = files[0]
+            result[key] = {
+                "name": latest.name,
+                "mtime_ago": _mtime_ago_str(latest.stat().st_mtime),
+            }
+    return result
+
+
 def _update_dde_health_from_rows(rows: list[Dict[str, Any]]) -> Dict[str, Any]:
     """
     依据当前轮询结果计算合约活跃度与品种熔断状态。
@@ -282,7 +318,7 @@ class MonitorStartRequest(BaseModel):
     min_profit: float = 30.0
     expiry_days: int = 90
     refresh: int = 3
-    atm_range: float = 0.20
+    n_each_side: int = 10
     zmq_port: int = 5555
     snapshot_dir: str = DEFAULT_MARKET_DATA_DIR
 
@@ -293,6 +329,7 @@ class DDEStartRequest(BaseModel):
 
 class RecorderStartRequest(BaseModel):
     source: str = Field(default="wind", pattern="^(wind|dde)$")
+    zmq_port: int = 5555
 
 
 class DDEPipelineStartRequest(BaseModel):
@@ -300,7 +337,7 @@ class DDEPipelineStartRequest(BaseModel):
     refresh: int = 3
     min_profit: float = 30.0
     expiry_days: int = 90
-    atm_range: float = 0.20
+    n_each_side: int = 10
 
 
 @app.get("/", response_class=HTMLResponse)
@@ -678,6 +715,7 @@ def get_state() -> Dict[str, Any]:
             "wind_50etf_optionchain": {"mtime_ago": _wind_optionchain_mtime_ago()},
             "wxy_50etf": {"mtime_ago": _wxy_50etf_mtime_ago()},
         },
+        "bond_files": _bond_files_info(),
     }
 
 
@@ -688,7 +726,7 @@ def start_recorder(req: RecorderStartRequest) -> Dict[str, Any]:
         raise HTTPException(status_code=409, detail=f"DataBus 已在运行 (PID {existing[0].pid})，请先关闭")
     if req.source == "dde":
         _ensure_infinitrader_running()
-    args = ["--source", req.source]
+    args = ["--source", req.source, "--port", str(req.zmq_port)]
     return {"ok": True, "started": spawn_module("data_bus.bus", args)}
 
 
@@ -701,8 +739,8 @@ def start_monitor(req: MonitorStartRequest) -> Dict[str, Any]:
         str(req.expiry_days),
         "--refresh",
         str(req.refresh),
-        "--atm-range",
-        str(req.atm_range),
+        "--n-each-side",
+        str(req.n_each_side),
         "--zmq-port",
         str(req.zmq_port),
         "--snapshot-dir",
@@ -734,7 +772,7 @@ def start_dde_pipeline(req: DDEPipelineStartRequest) -> Dict[str, Any]:
         "--min-profit", str(req.min_profit),
         "--expiry-days", str(req.expiry_days),
         "--refresh", str(req.refresh),
-        "--atm-range", str(req.atm_range),
+        "--n-each-side", str(req.n_each_side),
     ]
     mon_started = spawn_module("monitors.monitor", mon_args)
     return {
@@ -785,8 +823,8 @@ def reopen_process(pid: int) -> Dict[str, Any]:
             arg_from_cmd(cmd, "--expiry-days", "90"),
             "--refresh",
             arg_from_cmd(cmd, "--refresh", "3"),
-            "--atm-range",
-            arg_from_cmd(cmd, "--atm-range", "0.20"),
+            "--n-each-side",
+            arg_from_cmd(cmd, "--n-each-side", "10"),
             "--zmq-port",
             arg_from_cmd(cmd, "--zmq-port", "5555"),
             "--snapshot-dir",
@@ -839,6 +877,40 @@ def fetch_status() -> Dict[str, Any]:
 @app.post("/api/actions/merge")
 def run_merge_api() -> Dict[str, Any]:
     return run_merge(bj_today(), DEFAULT_MARKET_DATA_DIR)
+
+
+class FetchBondRequest(BaseModel):
+    kind: str = "all"  # shibor | cgb | all
+
+
+@app.post("/api/actions/fetch-bond")
+def fetch_bond(req: FetchBondRequest) -> Dict[str, Any]:
+    """抓取当日 CGB 和/或 Shibor 收益率曲线，保存至 D:\\MARKET_DATA\\macro。"""
+    from data_engine.bond_termstructure_fetcher import (
+        save_shibor_daily,
+        save_cgb_yieldcurve_daily,
+    )
+    target_date = bj_today()
+    base_dir = Path(DEFAULT_MARKET_DATA_DIR)
+    output: list[str] = []
+    ok = True
+    try:
+        if req.kind in ("shibor", "all"):
+            path = save_shibor_daily(target_date, base_dir=base_dir)
+            output.append(f"Shibor 已保存: {path.name}")
+        if req.kind in ("cgb", "all"):
+            path = save_cgb_yieldcurve_daily(target_date, base_dir=base_dir)
+            output.append(f"CGB 已保存: {path.name}")
+    except Exception as e:
+        ok = False
+        output.append(str(e))
+    return {
+        "ok": ok,
+        "date": target_date.strftime("%Y-%m-%d"),
+        "kind": req.kind,
+        "output": "\n".join(output),
+        "bond_files": _bond_files_info(),
+    }
 
 
 def main() -> None:

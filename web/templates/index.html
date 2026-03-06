@@ -53,7 +53,7 @@ pre{background:#0f172a;color:#e2e8f0;padding:10px;border-radius:8px;max-height:1
 <div class="row">
   <div class="card">
     <div class="card-title">DDE</div>
-    <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center">
+    <div>
       <button class="btn-primary" onclick="window.open('/dde','_blank')">打开 DDE 抓取面板</button>
     </div>
     <div id="metadataFiles" style="margin-top:8px;font-size:12px;color:#64748b"></div>
@@ -73,15 +73,24 @@ pre{background:#0f172a;color:#e2e8f0;padding:10px;border-radius:8px;max-height:1
     <pre id="fetchLog" style="display:none"></pre>
   </div>
   <div class="card">
-    <div class="card-title">DataBus <span id="recBadge"></span></div>
-    <div id="recStatus">加载中...</div>
-    <div style="margin-top:8px">
-      <button class="btn-secondary btn-sm" id="btnMerge" onclick="runMerge()">合并今日分片</button>
+    <div class="card-title">Yieldcurve</div>
+    <div style="display:flex;gap:8px;flex-wrap:wrap">
+      <button class="btn-secondary btn-sm" id="btnFetchCgb" onclick="runFetchBond('cgb')">抓取 CGB</button>
+      <button class="btn-secondary btn-sm" id="btnFetchShibor" onclick="runFetchBond('shibor')">抓取 Shibor</button>
     </div>
-    <pre id="mergeLog" style="display:none;margin-top:8px"></pre>
-    <hr class="sep"/>
-    <div id="recActions"></div>
+    <div id="bondFilesInfo" style="margin-top:8px;font-size:12px;color:#64748b"></div>
   </div>
+</div>
+
+<div class="card" style="margin-bottom:12px">
+  <div class="card-title">DataBus <span id="recBadge"></span></div>
+  <div id="recStatus">加载中...</div>
+  <div style="margin-top:8px">
+    <button class="btn-secondary btn-sm" id="btnMerge" onclick="runMerge()">合并今日分片</button>
+  </div>
+  <pre id="mergeLog" style="display:none;margin-top:8px"></pre>
+  <hr class="sep"/>
+  <div id="recActions"></div>
 </div>
 
 <div class="card" style="margin-bottom:12px">
@@ -90,7 +99,7 @@ pre{background:#0f172a;color:#e2e8f0;padding:10px;border-radius:8px;max-height:1
     <span class="kv" style="margin:0"><label style="min-width:auto;margin-right:4px">利润≥</label><input id="monProfit" value="30" type="number" step="1" style="width:60px"/>元</span>
     <span class="kv" style="margin:0"><label style="min-width:auto;margin-right:4px">到期≤</label><input id="monExpiry" value="90" type="number" style="width:55px"/>天</span>
     <span class="kv" style="margin:0"><label style="min-width:auto;margin-right:4px">刷新</label><input id="monRefresh" value="3" type="number" style="width:45px"/>秒</span>
-    <span class="kv" style="margin:0"><label style="min-width:auto;margin-right:4px">ATM</label><input id="monAtm" value="0.20" type="number" step="0.01" style="width:55px"/></span>
+    <span class="kv" style="margin:0"><label style="min-width:auto;margin-right:4px">ATM上下各</label><select id="monNEachSide"><option value="0" selected>all</option><option value="1">1</option><option value="2">2</option><option value="3">3</option><option value="4">4</option><option value="5">5</option><option value="6">6</option><option value="7">7</option><option value="8">8</option><option value="9">9</option><option value="10">10</option></select></span>
     <span class="kv" style="margin:0"><label style="min-width:auto;margin-right:4px">ZMQ端口</label><input id="monZmq" value="5555" type="number" style="width:60px"/></span>
     <button class="btn-primary" onclick="startMonitor()">启动 Monitor</button>
   </div>
@@ -143,16 +152,35 @@ function renderMetadataFiles(mf){
   }
   const oc = mf.wind_50etf_optionchain;
   const wxy = mf.wxy_50etf;
-  const parts = [];
+  const lines = [];
   if(oc){
     const s = oc.mtime_ago === "文件不存在" ? "badge-down" : "badge-ok";
-    parts.push(`wind_50etf_optionchain.xlsx <span class="badge ${s}">${oc.mtime_ago}</span>`);
+    lines.push(`<div class="kv" style="margin:2px 0">wind_50etf_optionchain.xlsx <span class="badge ${s}">${oc.mtime_ago}</span></div>`);
   }
   if(wxy){
     const s = wxy.mtime_ago === "文件不存在" ? "badge-down" : "badge-ok";
-    parts.push(`wxy_50etf.xlsx <span class="badge ${s}">${wxy.mtime_ago}</span>`);
+    lines.push(`<div class="kv" style="margin:2px 0">wxy_50etf.xlsx <span class="badge ${s}">${wxy.mtime_ago}</span></div>`);
   }
-  el.innerHTML = parts.length ? parts.join(" &nbsp; ") : "";
+  el.innerHTML = lines.join("");
+}
+
+function renderBondFiles(bf){
+  const el = $("bondFilesInfo");
+  if(!el || !bf) return;
+  const lines = [];
+  const cgb = bf.cgb_yieldcurve;
+  const shibor = bf.shibor_yieldcurve;
+  if(cgb){
+    const s = cgb.mtime_ago === "文件不存在" ? "badge-down" : "badge-ok";
+    const fname = cgb.name || "—";
+    lines.push(`<div class="kv" style="margin:2px 0">${fname} <span class="badge ${s}">${cgb.mtime_ago}</span></div>`);
+  }
+  if(shibor){
+    const s = shibor.mtime_ago === "文件不存在" ? "badge-down" : "badge-ok";
+    const fname = shibor.name || "—";
+    lines.push(`<div class="kv" style="margin:2px 0">${fname} <span class="badge ${s}">${shibor.mtime_ago}</span></div>`);
+  }
+  el.innerHTML = lines.join("");
 }
 
 function renderRecorder(st){
@@ -268,6 +296,7 @@ async function refresh(){
     marketDataDir = st.market_data_dir || marketDataDir;
     $("sTime").innerText = st.server_time;
     renderMetadataFiles(st.metadata_files);
+    renderBondFiles(st.bond_files);
     renderRecorder(st);
     renderProcessTable(st.processes);
   } catch(e){ console.error(e); }
@@ -300,7 +329,7 @@ async function killAll(){
 
 async function startRecorder(source="wind"){
   try{
-    const r = await api("/api/processes/recorder/start","POST", { source });
+    const r = await api("/api/processes/recorder/start","POST", { source, zmq_port: parseInt($("monZmq").value) || 5555 });
     toast(`${source.toUpperCase()} DataBus 已启动 PID `+r.started.pid);
   } catch(e){ toast(e.message, false); }
   setTimeout(refresh, 1500);
@@ -311,7 +340,7 @@ async function startMonitor(){
     min_profit: parseFloat($("monProfit").value),
     expiry_days: parseInt($("monExpiry").value),
     refresh: parseInt($("monRefresh").value),
-    atm_range: parseFloat($("monAtm").value),
+    n_each_side: parseInt($("monNEachSide").value) || 0,
     zmq_port: parseInt($("monZmq").value),
     snapshot_dir: marketDataDir
   };
@@ -383,6 +412,20 @@ async function runMerge(){
     toast(e.message, false);
   }
   $("btnMerge").disabled = false;
+  await refresh();
+}
+
+async function runFetchBond(kind){
+  const btn = kind === "cgb" ? $("btnFetchCgb") : $("btnFetchShibor");
+  btn.disabled = true;
+  try{
+    const r = await api("/api/actions/fetch-bond","POST",{kind});
+    toast(r.ok ? (kind === "cgb" ? "CGB 抓取完成" : "Shibor 抓取完成") : r.output, r.ok);
+    if(r.bond_files) renderBondFiles(r.bond_files);
+  } catch(e){
+    toast(e.message, false);
+  }
+  btn.disabled = false;
   await refresh();
 }
 

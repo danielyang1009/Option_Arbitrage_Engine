@@ -33,6 +33,7 @@ from models import (
     SignalType,
     TickData,
     TradeSignal,
+    normalize_code,
 )
 from config.settings import ETF_CODE_TO_NAME, UNDERLYINGS, TradingConfig, get_default_config
 from data_engine.contract_catalog import ContractInfoManager, get_optionchain_path
@@ -74,6 +75,18 @@ ETF_NAME_MAP: Dict[str, str] = {
 ETF_ORDER: List[str] = list(UNDERLYINGS)
 
 MONITOR_UNDERLYINGS = set(UNDERLYINGS)
+
+
+def _safe_int(v: object) -> int:
+    try:
+        if v is None:
+            return 0
+        f = float(v)
+        if math.isnan(f):
+            return 0
+        return int(round(f))
+    except Exception:
+        return 0
 
 
 
@@ -199,6 +212,8 @@ def restore_from_snapshot(
                     price=last,
                     ask_price=ask1,
                     bid_price=bid1,
+                    ask_volume=_safe_int(row.get("askv1")),
+                    bid_volume=_safe_int(row.get("bidv1")),
                     is_simulated=False,
                 )
                 strategy.on_etf_tick(tick)
@@ -207,6 +222,8 @@ def restore_from_snapshot(
             else:
                 if last <= 0 or math.isnan(ask1) or math.isnan(bid1):
                     continue
+                askv1 = _safe_int(row.get("askv1"))
+                bidv1 = _safe_int(row.get("bidv1"))
                 tick = TickData(
                     timestamp=tick_ts,
                     contract_code=code,
@@ -217,9 +234,9 @@ def restore_from_snapshot(
                     money=0.0,
                     position=int(row.get("oi") or 0),
                     ask_prices=[ask1] + [math.nan] * 4,
-                    ask_volumes=[100] + [0] * 4,
+                    ask_volumes=[askv1] + [0] * 4,
                     bid_prices=[bid1] + [math.nan] * 4,
-                    bid_volumes=[100] + [0] * 4,
+                    bid_volumes=[bidv1] + [0] * 4,
                 )
                 strategy.on_option_tick(tick)
             count += 1
@@ -249,21 +266,32 @@ def parse_zmq_message(
                 return None
             return ETFTickData(
                 timestamp=ts,
-                etf_code=d["code"],
+                etf_code=normalize_code(d["code"], ".SH"),
                 price=float(last),
                 ask_price=float(d.get("ask1") or math.nan),
                 bid_price=float(d.get("bid1") or math.nan),
+                ask_volume=_safe_int(d.get("askv1")),
+                bid_volume=_safe_int(d.get("bidv1")),
                 is_simulated=False,
             )
         else:
             last = d.get("last") or 0
-            ask1 = d.get("ask1") or math.nan
-            bid1 = d.get("bid1") or math.nan
-            if last <= 0 or math.isnan(float(ask1)) or math.isnan(float(bid1)):
+            ask1 = d.get("ask1")
+            bid1 = d.get("bid1")
+            askv1 = _safe_int(d.get("askv1"))
+            bidv1 = _safe_int(d.get("bidv1"))
+            if last <= 0:
                 return None
+            # 与 data_bus 回退逻辑保持一致：盘口缺失时用 last 兜底
+            ask1 = float(ask1) if ask1 is not None else float(last)
+            bid1 = float(bid1) if bid1 is not None else float(last)
+            if math.isnan(ask1):
+                ask1 = float(last)
+            if math.isnan(bid1):
+                bid1 = float(last)
             return TickData(
                 timestamp=ts,
-                contract_code=d["code"],
+                contract_code=normalize_code(d["code"], ".SH"),
                 current=float(last),
                 volume=d.get("vol") or 0,
                 high=float(d.get("high") or last),
@@ -271,9 +299,9 @@ def parse_zmq_message(
                 money=0.0,
                 position=d.get("oi") or 0,
                 ask_prices=[float(ask1)] + [math.nan] * 4,
-                ask_volumes=[100] + [0] * 4,
+                ask_volumes=[askv1] + [0] * 4,
                 bid_prices=[float(bid1)] + [math.nan] * 4,
-                bid_volumes=[100] + [0] * 4,
+                bid_volumes=[bidv1] + [0] * 4,
             )
     except Exception:
         return None
@@ -320,6 +348,13 @@ def signal_to_dict(sig: TradeSignal) -> dict:
         "multiplier": sig.multiplier,
         "is_adjusted": sig.is_adjusted,
         "calc_detail": sig.calc_detail,
+        "max_qty": sig.max_qty,
+        "spread_ratio": sig.spread_ratio,
+        "obi_c": sig.obi_c,
+        "obi_s": sig.obi_s,
+        "obi_p": sig.obi_p,
+        "net_1tick": sig.net_1tick,
+        "tolerance": sig.tolerance,
     }
 
 
@@ -337,9 +372,14 @@ def select_display_pairs(
 
     all_signals 来自 scan_pairs_for_display，按 strike 升序排列。
     返回结果按 (expiry, strike) 升序排列，总行数不超过 2 * n_each_side。
+    n_each_side=0 表示显示全部，不做数量限制。
 
     当某侧合约数量不足 n_each_side 时，返回该侧所有合约（不从另一侧补齐）。
     """
+    if n_each_side <= 0:
+        result = sorted(all_signals, key=lambda s: (s.expiry, s.strike))
+        return result
+
     below = [s for s in all_signals if s.strike <= etf_price]
     above = [s for s in all_signals if s.strike > etf_price]
 
