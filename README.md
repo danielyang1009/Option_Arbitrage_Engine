@@ -56,11 +56,12 @@ python -m monitors.monitor --zmq-port 5555
 ## 数据目录约定
 
 - 默认市场数据目录固定为：`D:\MARKET_DATA`
-- DataBus 的快照、分片、日合并文件均写入该目录：
-  - `D:\MARKET_DATA\snapshot_latest.parquet`
-  - `D:\MARKET_DATA\chunks\`
-  - `D:\MARKET_DATA\options_YYYYMMDD.parquet`
-  - `D:\MARKET_DATA\etf_YYYYMMDD.parquet`
+- DataBus 的快照、分片、日合并文件均写入该目录（按品种子目录存储）：
+  - `D:\MARKET_DATA\snapshot_latest.parquet`（全量，Monitor 冷启动用）
+  - `D:\MARKET_DATA\chunks\{510050|510300|510500}\options_YYYYMMDD_HHmmss.parquet`
+  - `D:\MARKET_DATA\{510050|510300|510500}\options_YYYYMMDD.parquet`（日终合并）
+  - `D:\MARKET_DATA\{510050|510300|510500}\etf_YYYYMMDD.parquet`
+- Parquet 压缩：zstd；options/snapshot 的 askv1/bidv1 为 int16，ETF 保持 int32
 - 宏观期限结构（`bond_termstructure_fetcher`）：
   - `D:\MARKET_DATA\macro\shibor\shibor_yieldcurve_YYYYMMDD.csv`（8 个 Shibor 期限，横表）
   - `D:\MARKET_DATA\macro\cgb_yield\cgb_yieldcurve_YYYYMMDD.csv`（17 个中债国债期限：0.0y～50y，横表）

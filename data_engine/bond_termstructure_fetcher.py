@@ -5,7 +5,8 @@
 
 数据来源：
     - Shibor：中国货币网 chinamoney.com.cn ShiborHis 接口
-    - 中债国债：中债官网 yield.chinabond.com.cn 「标准期限信息下载(excel)」
+    - 中债国债：中债官网 yield.chinabond.com.cn historyQuery 接口（HTML 表格解析）
+      查询近 7 日范围，自动取最新可用日期的「中债国债收益率曲线」行。
 
 用法示例（命令行）：
     python -m data_engine.bond_termstructure_fetcher --kind all
@@ -21,14 +22,12 @@ from __future__ import annotations
 import argparse
 import csv
 import logging
-from datetime import date, datetime
-from io import BytesIO
+from datetime import date, datetime, timedelta
+from io import StringIO
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 import requests
-import zipfile
-import xml.etree.ElementTree as ET
 
 from config.settings import DEFAULT_MARKET_DATA_DIR
 from utils.time_utils import bj_today
@@ -90,117 +89,89 @@ def fetch_shibor(target_date: Optional[date] = None) -> Dict[str, Any]:
 
 
 # ---------------------------------------------------------------------------
-# 2. 中债国债收益率曲线抓取（中债官网标准期限 Excel）
+# 2. 中债国债收益率曲线抓取（中债 historyQuery 接口，HTML 表格解析）
 # ---------------------------------------------------------------------------
 
-_CGB_FULL_TENORS = [
-    0.0, 0.08, 0.17, 0.25, 0.5, 0.75, 1.0, 2.0, 3.0,
-    5.0, 7.0, 10.0, 15.0, 20.0, 30.0, 40.0, 50.0,
-]
-_CGB_TENOR_COLS = [f"{t}y" for t in _CGB_FULL_TENORS]
-
-_CGB_EXCEL_URL = "https://yield.chinabond.com.cn/cbweb-mn/yc/downBzqxDetail"
-_CGB_EXCEL_BASE_PARAMS = {
-    # 对应“中债国债收益率曲线(到期)”的定义 ID
-    "ycDefIds": "2c9081e50a2f9606010a3068cae70001",
-    "zblx": "txy",
-    "dxbj": "0",
-    "qxlx": "0",
-    "yqqxN": "N",
-    "yqqxK": "K",
-    "wrjxCBFlag": "0",
-    "locale": "",
+# 8 个标准期限（来自 historyQuery 表格列）→ CSV 列名
+_CGB_AK_COL_TO_TENOR: Dict[str, str] = {
+    "3月":  "0.25y",
+    "6月":  "0.5y",
+    "1年":  "1.0y",
+    "3年":  "3.0y",
+    "5年":  "5.0y",
+    "7年":  "7.0y",
+    "10年": "10.0y",
+    "30年": "30.0y",
 }
+_CGB_TENOR_COLS: List[str] = list(_CGB_AK_COL_TO_TENOR.values())
 
-
-def _download_cgb_excel_bytes(target_date: date) -> bytes:
-    """
-    直接调用 downBzqxDetail 下载标准期限 Excel，返回原始字节流。
-    """
-    params = dict(_CGB_EXCEL_BASE_PARAMS)
-    params["workTime"] = target_date.strftime("%Y-%m-%d")
-
-    # 简单 UA 即可；经验证无需 Cookie 也能下载
-    headers = {
-        "User-Agent": (
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-            "AppleWebKit/537.36 (KHTML, like Gecko) "
-            "Chrome/145.0.0.0 Safari/537.36"
-        ),
-        "Accept": "application/octet-stream,application/vnd.ms-excel,application/x-msdownload,*/*;q=0.1",
-        "Referer": "https://yield.chinabond.com.cn/cbweb-mn/yield_main?locale=zh_CN",
-    }
-    resp = requests.get(_CGB_EXCEL_URL, params=params, headers=headers, timeout=15)
-    resp.raise_for_status()
-    return resp.content
-
-
-def _parse_cgb_excel(content: bytes) -> Dict[str, float]:
-    """
-    解析中债标准期限 Excel，返回 tenor->yield 映射（如 {'0.08y': 1.2331, ...}）。
-
-    为避免额外依赖 openpyxl，这里直接解析 sheet1.xml。
-    """
-    ns = {"main": "http://schemas.openxmlformats.org/spreadsheetml/2006/main"}
-    with zipfile.ZipFile(BytesIO(content)) as zf:
-        with zf.open("xl/worksheets/sheet1.xml") as f:
-            root = ET.parse(f).getroot()
-
-    result: Dict[str, float] = {}
-    for row in root.findall(".//main:row", ns):
-        cells = row.findall("main:c", ns)
-        if len(cells) < 3:
-            continue
-
-        def _cell_text(cell) -> Optional[str]:
-            t = cell.get("t")
-            if t == "inlineStr":
-                is_node = cell.find("main:is/main:t", ns)
-                return is_node.text.strip() if is_node is not None and is_node.text else None
-            v = cell.find("main:v", ns)
-            return v.text.strip() if v is not None and v.text else None
-
-        tenor_text = _cell_text(cells[1])
-        y_text = _cell_text(cells[2])
-        if not tenor_text or not y_text:
-            continue
-
-        try:
-            # 仅用于校验是数字；真实标签仍用文本
-            float(tenor_text)
-            y_val = float(y_text)
-        except ValueError:
-            # 跳过表头等非数值行
-            continue
-
-        key = f"{tenor_text}y"
-        result[key] = round(y_val, 4)
-
-    return result
+_CGB_HISTORY_URL = (
+    "https://yield.chinabond.com.cn/cbweb-pbc-web/pbc/historyQuery"
+)
+_CGB_CURVE_NAME = "中债国债收益率曲线"
 
 
 def fetch_cgb_yieldcurve(target_date: Optional[date] = None) -> Dict[str, Any]:
     """
-    通过中债官网「标准期限信息下载(excel)」抓取完整国债收益率曲线（17 个标准期限）。
+    通过中债 historyQuery 接口抓取国债收益率曲线（8 个标准期限）。
+
+    若 target_date 当日数据尚未发布，自动向前最多回溯 7 个自然日，
+    取最新可用日期的「中债国债收益率曲线」行。
 
     Args:
         target_date: 目标日期；未指定则使用 bj_today()
     Returns:
-        {"date": "YYYY-MM-DD", "0.0y": ..., "0.08y": ..., ..., "50y": ...}
+        {"date": "YYYY-MM-DD", "0.25y": ..., "0.5y": ..., ..., "30.0y": ...}
+        data_date 字段反映实际数据日期（可能早于 target_date）。
     """
-    d = target_date or bj_today()
-    date_str = d.strftime("%Y-%m-%d")
-    out: Dict[str, Any] = {"date": date_str, **{f"{t}y": None for t in _CGB_FULL_TENORS}}
+    import math
+    import pandas as pd
 
+    d = target_date or bj_today()
+    out: Dict[str, Any] = {"date": d.strftime("%Y-%m-%d"), **{t: None for t in _CGB_TENOR_COLS}}
+
+    start_date = d - timedelta(days=7)
+    params = {
+        "startDate": start_date.strftime("%Y-%m-%d"),
+        "endDate":   d.strftime("%Y-%m-%d"),
+        "gjqx": "0",
+        "qxId": "ycqx",
+        "locale": "cn_ZH",
+    }
+    headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36"
+        ),
+    }
     try:
-        content = _download_cgb_excel_bytes(d)
-        tenor_to_yield = _parse_cgb_excel(content)
-        if not tenor_to_yield:
-            logger.warning("中债标准期限 Excel 未解析出任何收益率数据")
+        resp = requests.get(_CGB_HISTORY_URL, params=params, headers=headers, timeout=15)
+        resp.raise_for_status()
+        text = resp.text.replace("&nbsp", "")
+        tables = pd.read_html(StringIO(text), header=0)
+        # 数据在第二张表（index=1）
+        if len(tables) < 2:
+            logger.warning("中债 historyQuery 未找到数据表")
             return out
-        for k, v in tenor_to_yield.items():
-            if k in out:
-                out[k] = v
+        df = tables[1]
+        cgb_df = df[df["曲线名称"] == _CGB_CURVE_NAME].copy()
+        if cgb_df.empty:
+            logger.warning("中债 historyQuery 表中未找到「%s」行", _CGB_CURVE_NAME)
+            return out
+        # 取最新日期行
+        cgb_df["日期"] = pd.to_datetime(cgb_df["日期"], errors="coerce").dt.date
+        cgb_df = cgb_df.sort_values("日期", ascending=False)
+        row = cgb_df.iloc[0]
+        data_date = row["日期"]
+        out["date"] = data_date.strftime("%Y-%m-%d") if data_date else d.strftime("%Y-%m-%d")
+        for ak_col, tenor in _CGB_AK_COL_TO_TENOR.items():
+            val = row.get(ak_col)
+            if val is not None and not (isinstance(val, float) and math.isnan(val)):
+                out[tenor] = round(float(val), 4)
+        if data_date and data_date < d:
+            logger.warning(
+                "中债收益率曲线：%s 暂无数据，使用最近可用日期 %s", d, data_date
+            )
     except Exception as e:
         logger.warning("中债国债收益率曲线抓取失败: %s", e)
     return out
@@ -241,6 +212,13 @@ def save_cgb_yieldcurve_daily(target_date: date, base_dir: Optional[Path] = None
     out_path = out_dir / fname
 
     row = fetch_cgb_yieldcurve(target_date)
+    valid_count = sum(1 for k in _CGB_TENOR_COLS if row.get(k) is not None)
+    if valid_count < len(_CGB_TENOR_COLS):
+        raise RuntimeError(
+            f"中债国债收益率曲线数据不完整（{target_date}，有效期限 {valid_count}/{len(_CGB_TENOR_COLS)} 个），跳过落盘以避免覆盖有效文件"
+        )
+    # date 列统一写文件名对应的 target_date，避免回退日期导致 from_cgb_daily 校验失败
+    row["date"] = target_date.strftime("%Y-%m-%d")
     cols = ["date"] + _CGB_TENOR_COLS
     with out_path.open("w", newline="", encoding="utf-8-sig") as f:
         writer = csv.writer(f)

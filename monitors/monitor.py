@@ -42,7 +42,7 @@ from monitors.common import (
     init_strategy_and_contracts,
     parse_zmq_message,
     restore_from_snapshot,
-    select_display_pairs,
+    select_pairs_by_atm,
 )
 from config.settings import DEFAULT_MARKET_DATA_DIR, UNDERLYINGS
 from models import (
@@ -112,6 +112,7 @@ _VIX_TARGETS = list(UNDERLYINGS)
 def _build_etf_table(
     underlying: str,
     sigs: List[TradeSignal],
+    display_pairs_u: List[Tuple[ContractInfo, ContractInfo]],
     price: float,
     min_profit: float,
     vix_value: Optional[float] = None,
@@ -167,7 +168,7 @@ def _build_etf_table(
         # 乘数列已移至每组 Rule 标题，此处不再单独列出
         return tbl
 
-    def _add_sig_row(tbl: Table, sig: TradeSignal) -> None:
+    def _add_sig_row(tbl: Table, sig: TradeSignal, *, is_atm: bool = False) -> None:
         profit = sig.net_profit_estimate
         if profit >= min_profit:
             profit_str = f"[bold green]{profit:.0f}[/bold green]"
@@ -179,8 +180,11 @@ def _build_etf_table(
             profit_str = f"[dim]{profit:.0f}[/dim]"
             dir_str = ""
         adj_tag = " [dim]A[/dim]" if sig.is_adjusted else ""
+        strike_str = f"{sig.strike:.2f}{adj_tag}"
+        if is_atm:
+            strike_str = f"[yellow]{strike_str}[/yellow]"
         tbl.add_row(
-            f"{sig.strike:.2f}{adj_tag}",
+            strike_str,
             dir_str,
             profit_str,
             f"{sig.net_1tick:.0f}" if sig.net_1tick is not None else "--",
@@ -195,7 +199,7 @@ def _build_etf_table(
             f"{sig.spot_price:.4f}",
         )
 
-    if not sigs:
+    if not display_pairs_u:
         tbl = _make_table(show_header=True)
         tbl.add_row(*["—"] * 13)
         return Panel(tbl, title=panel_title, subtitle=panel_subtitle,
@@ -203,17 +207,27 @@ def _build_etf_table(
 
     today = bj_today()
 
-    # 按 (到期日, 乘数) 分组——同一到期日的标准合约与调整型合约各为独立组
-    by_expiry_mult: Dict[Tuple[date, int], List[TradeSignal]] = defaultdict(list)
+    # 建立信号查找表：(expiry, multiplier, strike) -> TradeSignal
+    sig_map: Dict[Tuple[date, int, float], TradeSignal] = {}
     for sig in sigs:
-        by_expiry_mult[(sig.expiry, sig.multiplier)].append(sig)
+        sig_map[(sig.expiry, sig.multiplier, sig.strike)] = sig
+
+    # 以 display_pairs_u 为主，按 (到期日, 乘数) 分组——同一到期日的标准与调整型各为独立组
+    by_expiry_mult: Dict[Tuple[date, int], List[float]] = defaultdict(list)
+    group_is_adjusted: Dict[Tuple[date, int], bool] = {}
+    for call_info, _ in display_pairs_u:
+        key = (call_info.expiry_date, call_info.contract_unit)
+        by_expiry_mult[key].append(call_info.strike_price)
+        group_is_adjusted[key] = call_info.is_adjusted
+    for key in by_expiry_mult:
+        by_expiry_mult[key] = sorted(set(by_expiry_mult[key]))
 
     renderables: List = []
 
     # 全局共用列名，置于面板最顶部，仅显示一次
     renderables.append(_make_table(show_header=True))
 
-    for (expiry, mult), group in sorted(by_expiry_mult.items()):
+    for (expiry, mult), strikes in sorted(by_expiry_mult.items()):
         cal_days = (expiry - today).days + 1  # 含今天和到期日两端
         trade_days = _trading_days_until(expiry, today)
 
@@ -222,11 +236,22 @@ def _build_etf_table(
             f"[bold]{expiry.strftime('%Y-%m-%d')}[/bold]"
             f"  [dim]自然日 {cal_days}天  交易日 {trade_days}天  ×{mult}[/dim]"
         )
-        renderables.append(Rule(rule_title, style="cyan"))        # 居中（默认 align="center"）
+        renderables.append(Rule(rule_title, style="cyan"))
 
         data_tbl = _make_table(show_header=False)
-        for sig in sorted(group, key=lambda s: s.strike):
-            _add_sig_row(data_tbl, sig)
+        is_adj = group_is_adjusted.get((expiry, mult), False)
+        adj_tag = " [dim]A[/dim]" if is_adj else ""
+        atm_strike = min(strikes, key=lambda x: abs(x - price)) if price > 0 and strikes else None
+        for strike in strikes:
+            is_atm = (strike == atm_strike)
+            sig = sig_map.get((expiry, mult, strike))
+            if sig is not None:
+                _add_sig_row(data_tbl, sig, is_atm=is_atm)
+            else:
+                strike_str = f"{strike:.2f}{adj_tag}"
+                if is_atm:
+                    strike_str = f"[yellow]{strike_str}[/yellow]"
+                data_tbl.add_row(strike_str, *["--"] * 12)
         renderables.append(data_tbl)
 
     return Panel(
@@ -244,39 +269,44 @@ def build_display(
     ts: datetime,
     etf_prices: Dict[str, float],
     vix_values: Dict[str, Optional[float]],
-    pairs_for_scan: List[Tuple[ContractInfo, ContractInfo]],
+    display_pairs: List[Tuple[ContractInfo, ContractInfo]],
     iteration: int,
     min_profit: float,
-    n_each_side: int = 10,
     no_data_hint: Optional[str] = None,
+    rate_label: str = "",
 ) -> RenderGroup:
-    """构建套利信号布局，按品种分块显示（每品种固定 ATM 上下各 n_each_side 行）"""
+    """构建套利信号布局，按品种分块显示。display_pairs 已由调用方做 ATM±N 筛选。"""
     header = Panel(
         f"[bold bright_green]⚡ DeltaZero 正向套利监控[/bold bright_green]  "
-        f"[dim]{ts.strftime('%H:%M:%S')}[/dim]  第 {iteration} 次刷新",
+        f"[dim]{ts.strftime('%H:%M:%S')}[/dim]  第 {iteration} 次刷新"
+        + (f"  {rate_label}" if rate_label else ""),
         box=box.MINIMAL,
         padding=(0, 1),
     )
 
-    # 按品种分组，再各自按 ATM 上下各取 n_each_side
-    groups: Dict[str, List[TradeSignal]] = defaultdict(list)
+    # 信号按品种分组
+    sig_groups: Dict[str, List[TradeSignal]] = defaultdict(list)
     for sig in all_display_signals:
-        groups[sig.underlying_code].append(sig)
+        sig_groups[sig.underlying_code].append(sig)
+
+    # display_pairs 按品种分组
+    pair_groups: Dict[str, List[Tuple[ContractInfo, ContractInfo]]] = defaultdict(list)
+    for pair in display_pairs:
+        pair_groups[pair[0].underlying_code].append(pair)
 
     underlying_list = [c for c in ETF_ORDER if c in etf_prices]
     tables = []
     for u in underlying_list:
         etf_px = etf_prices.get(u, 0.0)
-        u_sigs = groups.get(u, [])
-        display_sigs = select_display_pairs(u_sigs, etf_px, n_each_side) if u_sigs else []
-        # 第二行统计均在显示范围内（ATM 上下各 n_each_side），与表格内容一致
-        n_pairs_u = len(display_sigs)  # 显示配对 = 表格行数
-        n_opts_u = 2 * len(display_sigs)  # 每配对 2 个期权（Call+Put）
-        n_positive_u = sum(1 for s in display_sigs if s.net_profit_estimate >= 0)
-        n_profitable_u = sum(1 for s in display_sigs if s.net_profit_estimate >= min_profit)
+        u_sigs = sig_groups.get(u, [])
+        u_pairs = pair_groups.get(u, [])
+        n_pairs_u = len({(p[0].expiry_date, p[0].contract_unit, p[0].strike_price) for p in u_pairs})
+        n_opts_u = 2 * n_pairs_u
+        n_positive_u = sum(1 for s in u_sigs if s.net_profit_estimate >= 0)
+        n_profitable_u = sum(1 for s in u_sigs if s.net_profit_estimate >= min_profit)
         tables.append(
             _build_etf_table(
-                u, display_sigs, etf_px, min_profit, vix_values.get(u),
+                u, u_sigs, u_pairs, etf_px, min_profit, vix_values.get(u),
                 n_pairs=n_pairs_u, n_opts=n_opts_u,
                 n_positive=n_positive_u, n_profitable=n_profitable_u,
             )
@@ -365,16 +395,32 @@ def run_monitor(
     no_data_cycles = 0  # 连续未收到 ZMQ 消息的刷新次数
     # 仅展示“当前实时流里出现过”的标的，避免历史快照把未订阅品种带出来
     stream_underlyings: set[str] = set()
+    import warnings as _warnings
     try:
-        yield_curve = BoundedCubicSplineRate.from_cgb_daily(
-            base_dir=DEFAULT_MARKET_DATA_DIR,
-            require_exists=True,
-        )
+        with _warnings.catch_warnings(record=True) as _w:
+            _warnings.simplefilter("always")
+            yield_curve = BoundedCubicSplineRate.from_cgb_daily(
+                base_dir=DEFAULT_MARKET_DATA_DIR,
+                require_exists=True,
+            )
         vix_engine = VIXEngine(risk_free_rate=yield_curve)
-        console.print("[dim]VIX 使用插值国债收益率曲线[/dim]")
+        _date_tag = str(yield_curve.data_date) if yield_curve.data_date else "?"
+        _pts = "  ".join(
+            f"{lbl}={yield_curve.get_rate(d)*100:.2f}%"
+            for lbl, d in [("1M", 30), ("3M", 91), ("6M", 182), ("1Y", 365)]
+        )
+        _fallback = "(回退) " if _w else ""
+        rate_label = (
+            f"[{'yellow' if _w else 'dim'}]"
+            f"利率: CGB {_fallback}{_date_tag}  {_pts}"
+            f"[/{'yellow' if _w else 'dim'}]"
+        )
+        console.print(rate_label)
     except FileNotFoundError:
         vix_engine = VIXEngine(risk_free_rate=strategy.config.risk_free_rate)
-        console.print("[yellow]未找到中债曲线，VIX 使用固定利率 {:.2%}[/yellow]".format(strategy.config.risk_free_rate))
+        _fixed = strategy.config.risk_free_rate
+        rate_label = f"[yellow]利率: 固定 {_fixed:.2%}（未找到CGB曲线）[/yellow]"
+        console.print(rate_label)
     vix_pairs, vix_option_codes = build_pairs_and_codes(
         contract_mgr, active, etf_prices, atm_range_pct=1.0
     )
@@ -389,6 +435,7 @@ def run_monitor(
         return build_display(
             last_signals, datetime.now(), etf_display, vix_display,
             pairs, iteration, min_profit,
+            rate_label=rate_label,
         )
 
     try:
@@ -430,7 +477,8 @@ def run_monitor(
                         pairs_for_scan = pairs
                         etf_display_view = etf_display
 
-                    last_signals = strategy.scan_pairs_for_display(pairs_for_scan, current_time=now)
+                    display_pairs = select_pairs_by_atm(pairs_for_scan, etf_display_view, n_each_side)
+                    last_signals = strategy.scan_pairs_for_display(display_pairs, current_time=now)
                     for u in [x for x in _VIX_TARGETS if x in etf_display_view]:
                         result = vix_engine.compute_for_underlying(
                             vix_pairs_by_underlying.get(u, []),
@@ -455,9 +503,9 @@ def run_monitor(
                     def render_filtered() -> RenderGroup:
                         return build_display(
                             last_signals, datetime.now(), etf_display_view, vix_display,
-                            pairs_for_scan, iteration, min_profit,
-                            n_each_side=n_each_side,
+                            display_pairs, iteration, min_profit,
                             no_data_hint=no_data_hint,
+                            rate_label=rate_label,
                         )
                     live.update(render_filtered())
 

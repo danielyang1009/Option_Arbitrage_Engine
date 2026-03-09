@@ -16,25 +16,34 @@ Parquet 分片写入器
 目录结构：
     {output_dir}/
     ├── chunks/
-    │   ├── options_20260303_093000.parquet   ← 期权分片（按时间命名）
-    │   ├── options_20260303_093030.parquet
-    │   ├── etf_20260303_093000.parquet       ← ETF 分片
-    │   └── ...
-    ├── snapshot_latest.parquet               ← 实时最新快照（供策略冷启动使用）
-    ├── options_20260303.parquet              ← 日终合并后的日文件
-    └── etf_20260303.parquet
+    │   ├── 510050/
+    │   │   ├── options_20260303_093000.parquet   ← 期权分片（按品种 + 时间命名）
+    │   │   └── etf_20260303_093000.parquet
+    │   ├── 510300/
+    │   └── 510500/
+    ├── 510050/
+    │   ├── options_20260303.parquet              ← 日终合并后的日文件
+    │   └── etf_20260303.parquet
+    ├── 510300/
+    ├── 510500/
+    └── snapshot_latest.parquet                   ← 全量快照（供策略冷启动使用）
 
 Parquet Schema：
     options: ts(int64), code(str), underlying(str),
              last(float32), ask1(float32), bid1(float32),
+             askv1(int16), bidv1(int16),
              oi(int32), vol(int32), high(float32), low(float32),
              is_adjusted(bool), multiplier(int32)
     etf:     ts(int64), code(str),
-             last(float32), ask1(float32), bid1(float32)
+             last(float32), ask1(float32), bid1(float32),
+             askv1(int32), bidv1(int32)             ← ETF 档量以股计，保留 int32
     snapshot: type(str), code(str), underlying(str),
               ts(int64), last(float32), ask1(float32), bid1(float32),
+              askv1(int16), bidv1(int16),
               oi(int32), vol(int32), high(float32), low(float32),
               is_adjusted(bool), multiplier(int32)
+
+压缩：zstd（压缩比优于 snappy，读速相近）
 """
 
 from __future__ import annotations
@@ -63,8 +72,8 @@ def _get_option_schema():
         pa.field("last",        pa.float32()),
         pa.field("ask1",        pa.float32()),
         pa.field("bid1",        pa.float32()),
-        pa.field("askv1",       pa.int32()),
-        pa.field("bidv1",       pa.int32()),
+        pa.field("askv1",       pa.int16()),   # 期权每档量极少超 32767 手
+        pa.field("bidv1",       pa.int16()),
         pa.field("oi",          pa.int32()),
         pa.field("vol",         pa.int32()),
         pa.field("high",        pa.float32()),
@@ -95,8 +104,8 @@ def _get_snapshot_schema():
         pa.field("last",        pa.float32()),
         pa.field("ask1",        pa.float32()),
         pa.field("bid1",        pa.float32()),
-        pa.field("askv1",       pa.int32()),
-        pa.field("bidv1",       pa.int32()),
+        pa.field("askv1",       pa.int16()),   # 期权每档量极少超 32767 手
+        pa.field("bidv1",       pa.int16()),
         pa.field("oi",          pa.int32()),
         pa.field("vol",         pa.int32()),
         pa.field("high",        pa.float32()),
@@ -207,19 +216,31 @@ class ParquetWriter:
         date_str = dt.strftime("%Y%m%d")
 
         if opt_rows:
-            path = self._chunks_dir / f"options_{date_str}_{ts_str}.parquet"
-            _write_rows(opt_rows, path, _get_option_schema(), _option_row_to_arrays)
-            total += len(opt_rows)
-            logger.debug("写入期权分片 %s (%d 行)", path.name, len(opt_rows))
+            by_ul: Dict[str, List[Dict]] = defaultdict(list)
+            for row in opt_rows:
+                by_ul[row["underlying"].replace(".SH", "")].append(row)
+            for ul, rows in by_ul.items():
+                ul_dir = self._chunks_dir / ul
+                ul_dir.mkdir(parents=True, exist_ok=True)
+                path = ul_dir / f"options_{date_str}_{ts_str}.parquet"
+                _write_rows(rows, path, _get_option_schema(), _option_row_to_arrays)
+                total += len(rows)
+                logger.debug("写入期权分片 %s/%s (%d 行)", ul, path.name, len(rows))
 
         if etf_rows:
-            path = self._chunks_dir / f"etf_{date_str}_{ts_str}.parquet"
-            _write_rows(etf_rows, path, _get_etf_schema(), _etf_row_to_arrays)
-            total += len(etf_rows)
-            logger.debug("写入 ETF 分片 %s (%d 行)", path.name, len(etf_rows))
+            by_ul = defaultdict(list)
+            for row in etf_rows:
+                by_ul[row["code"].replace(".SH", "")].append(row)
+            for ul, rows in by_ul.items():
+                ul_dir = self._chunks_dir / ul
+                ul_dir.mkdir(parents=True, exist_ok=True)
+                path = ul_dir / f"etf_{date_str}_{ts_str}.parquet"
+                _write_rows(rows, path, _get_etf_schema(), _etf_row_to_arrays)
+                total += len(rows)
+                logger.debug("写入 ETF 分片 %s/%s (%d 行)", ul, path.name, len(rows))
 
-        # 更新最新快照文件
-        if snap_rows:
+        # 更新最新快照文件（仅在收盘前，15:00 后停止覆盖）
+        if snap_rows and dt.hour < 15:
             snap_path = self._root / "snapshot_latest.parquet"
             _write_rows(snap_rows, snap_path, _get_snapshot_schema(), _snapshot_row_to_arrays)
 
@@ -245,59 +266,61 @@ class ParquetWriter:
             target_date = bj_today()
         date_str = target_date.strftime("%Y%m%d")
 
-        for prefix, schema, row_func in [
-            ("options", _get_option_schema(), _option_row_to_arrays),
-            ("etf",     _get_etf_schema(),    _etf_row_to_arrays),
-        ]:
-            chunks = sorted(self._chunks_dir.glob(f"{prefix}_{date_str}_*.parquet"))
-            if not chunks:
+        import pyarrow.parquet as pq
+        import pyarrow as pa
+        import pyarrow.compute as pc
+        import pandas as pd
+
+        for ul_dir in sorted(self._chunks_dir.iterdir()):
+            if not ul_dir.is_dir():
                 continue
+            ul = ul_dir.name  # e.g. "510050"
+            out_ul_dir = self._root / ul
+            out_ul_dir.mkdir(parents=True, exist_ok=True)
 
-            try:
-                import pyarrow.parquet as pq
-                import pandas as pd
+            for prefix in ("options", "etf"):
+                chunks = sorted(ul_dir.glob(f"{prefix}_{date_str}_*.parquet"))
+                if not chunks:
+                    continue
 
-                tables = [pq.read_table(str(c)) for c in chunks]
-                import pyarrow as pa
-                merged = pa.concat_tables(tables)
-                # 按时间戳排序
-                import pyarrow.compute as pc
-                idx = pc.sort_indices(merged, sort_keys=[("ts", "ascending")])
-                merged = merged.take(idx)
-                original_count = merged.num_rows
+                try:
+                    tables = [pq.read_table(str(c)) for c in chunks]
+                    merged = pa.concat_tables(tables)
+                    idx = pc.sort_indices(merged, sort_keys=[("ts", "ascending")])
+                    merged = merged.take(idx)
+                    original_count = merged.num_rows
 
-                # 过滤：仅保留交易时间 9:30-11:30、13:00-15:00
-                if original_count > 0 and "ts" in merged.column_names:
-                    df = merged.to_pandas()
-                    df["_dt"] = pd.to_datetime(df["ts"], unit="ms", utc=True)
-                    df["_dt"] = df["_dt"].dt.tz_convert("Asia/Shanghai").dt.tz_localize(None)
-                    df["_h"] = df["_dt"].dt.hour
-                    df["_m"] = df["_dt"].dt.minute
-                    df["_date_ok"] = df["_dt"].dt.date == target_date
-                    mask = df["_date_ok"] & (
-                        ((df["_h"] == 9) & (df["_m"] >= 30))
-                        | ((df["_h"] == 10))
-                        | ((df["_h"] == 11) & (df["_m"] <= 30))
-                        | ((df["_h"] == 13))
-                        | ((df["_h"] == 14))
-                        | ((df["_h"] == 15) & (df["_m"] == 0))
-                    )
-                    df = df[mask].drop(columns=["_dt", "_h", "_m", "_date_ok"])
-                    merged = pa.Table.from_pandas(df, preserve_index=False)
-                    n_dropped = original_count - merged.num_rows
-                    if n_dropped > 0:
-                        logger.info("过滤非交易时间 tick: %d 条", n_dropped)
+                    # 过滤：仅保留交易时间 9:30-11:30、13:00-15:00
+                    if original_count > 0 and "ts" in merged.column_names:
+                        df = merged.to_pandas()
+                        df["_dt"] = pd.to_datetime(df["ts"], unit="ms", utc=True)
+                        df["_dt"] = df["_dt"].dt.tz_convert("Asia/Shanghai").dt.tz_localize(None)
+                        df["_h"] = df["_dt"].dt.hour
+                        df["_m"] = df["_dt"].dt.minute
+                        df["_date_ok"] = df["_dt"].dt.date == target_date
+                        mask = df["_date_ok"] & (
+                            ((df["_h"] == 9) & (df["_m"] >= 30))
+                            | ((df["_h"] == 10))
+                            | ((df["_h"] == 11) & (df["_m"] <= 30))
+                            | ((df["_h"] == 13))
+                            | ((df["_h"] == 14))
+                            | ((df["_h"] == 15) & (df["_m"] == 0))
+                        )
+                        df = df[mask].drop(columns=["_dt", "_h", "_m", "_date_ok"])
+                        merged = pa.Table.from_pandas(df, preserve_index=False)
+                        n_dropped = original_count - merged.num_rows
+                        if n_dropped > 0:
+                            logger.info("过滤非交易时间 tick [%s/%s]: %d 条", ul, prefix, n_dropped)
 
-                out_path = self._root / f"{prefix}_{date_str}.parquet"
-                pq.write_table(merged, str(out_path), compression="snappy")
-                logger.info("日终合并完成：%s (%d 行，%d 个分片)",
-                            out_path.name, merged.num_rows, len(chunks))
+                    out_path = out_ul_dir / f"{prefix}_{date_str}.parquet"
+                    pq.write_table(merged, str(out_path), compression="zstd")
+                    logger.info("日终合并完成：%s/%s (%d 行，%d 个分片)",
+                                ul, out_path.name, merged.num_rows, len(chunks))
 
-                # 删除分片
-                for c in chunks:
-                    c.unlink(missing_ok=True)
-            except Exception as e:
-                logger.error("日终合并失败 [%s]: %s", prefix, e)
+                    for c in chunks:
+                        c.unlink(missing_ok=True)
+                except Exception as e:
+                    logger.error("日终合并失败 [%s/%s]: %s", ul, prefix, e)
 
     # ──────────────────────────────────────────────────────────
     # 快照读取（供策略模块冷启动恢复状态）
@@ -362,7 +385,7 @@ def _write_rows(rows: List[Dict], path: Path, schema, row_to_arrays_fn) -> None:
     import pyarrow.parquet as pq
     arrays = row_to_arrays_fn(rows)
     table = pa.table(arrays, schema=schema)
-    pq.write_table(table, str(path), compression="snappy")
+    pq.write_table(table, str(path), compression="zstd")
 
 
 def _option_row_to_arrays(rows: List[Dict]) -> Dict[str, list]:

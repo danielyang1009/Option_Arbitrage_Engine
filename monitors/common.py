@@ -24,7 +24,7 @@ import sys
 from collections import defaultdict
 from datetime import date, datetime
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple, Union
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 from models import (
     ContractInfo,
@@ -362,35 +362,43 @@ def signal_to_dict(sig: TradeSignal) -> dict:
 # 展示行筛选
 # ══════════════════════════════════════════════════════════════════════
 
-def select_display_pairs(
-    all_signals: List[TradeSignal],
-    etf_price: float,
-    n_each_side: int = 10,
-) -> List[TradeSignal]:
+def select_pairs_by_atm(
+    pairs: List[Tuple["ContractInfo", "ContractInfo"]],
+    etf_prices: Dict[str, float],
+    n_each_side: int,
+) -> List[Tuple["ContractInfo", "ContractInfo"]]:
     """
-    按行权价相对平值排序，取平值下方 n_each_side 个 + 平值上方 n_each_side 个。
+    从完整配对列表中，按 (underlying, expiry, multiplier) 分组，
+    各组独立找 ATM ± n_each_side 行权价，返回筛选后的配对列表。
 
-    all_signals 来自 scan_pairs_for_display，按 strike 升序排列。
-    返回结果按 (expiry, strike) 升序排列，总行数不超过 2 * n_each_side。
-    n_each_side=0 表示显示全部，不做数量限制。
-
-    当某侧合约数量不足 n_each_side 时，返回该侧所有合约（不从另一侧补齐）。
+    n_each_side=1 → 每组最多 3 个行权价（ATM + 上下各 1）
+    n_each_side=0 → 返回全部，不做限制
     """
     if n_each_side <= 0:
-        result = sorted(all_signals, key=lambda s: (s.expiry, s.strike))
-        return result
+        return list(pairs)
 
-    below = [s for s in all_signals if s.strike <= etf_price]
-    above = [s for s in all_signals if s.strike > etf_price]
+    groups: Dict[Tuple, List] = defaultdict(list)
+    for pair in pairs:
+        call_info = pair[0]
+        key = (call_info.underlying_code, call_info.expiry_date, call_info.contract_unit)
+        groups[key].append(pair)
 
-    # below 取距平值最近的 n 个（即 strike 最大的 n 个）
-    below_sel = sorted(below, key=lambda s: s.strike, reverse=True)[:n_each_side]
-    # above 取距平值最近的 n 个（即 strike 最小的 n 个）
-    above_sel = sorted(above, key=lambda s: s.strike)[:n_each_side]
+    result = []
+    for (underlying, _expiry, _mult), group_pairs in groups.items():
+        etf_px = etf_prices.get(underlying, 0.0)
+        unique_strikes = sorted({p[0].strike_price for p in group_pairs})
+        if not unique_strikes:
+            continue
+        if etf_px <= 0:
+            result.extend(group_pairs)
+            continue
+        atm_strike = min(unique_strikes, key=lambda x: abs(x - etf_px))
+        below = set(sorted([k for k in unique_strikes if k < atm_strike], reverse=True)[:n_each_side])
+        above = set(sorted([k for k in unique_strikes if k > atm_strike])[:n_each_side])
+        selected = below | {atm_strike} | above
+        result.extend(p for p in group_pairs if p[0].strike_price in selected)
 
-    combined = below_sel + above_sel
-    combined.sort(key=lambda s: (s.expiry, s.strike))
-    return combined
+    return result
 
 
 # ══════════════════════════════════════════════════════════════════════

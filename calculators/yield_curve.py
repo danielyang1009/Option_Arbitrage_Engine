@@ -112,20 +112,41 @@ class BoundedCubicSplineRate:
         """
         从标准日文件加载曲线。
         - target_date=None: 默认使用今天
-        - 当文件不存在且 require_exists=True 时抛错
+        - 若当日文件不存在，自动回退至 7 个自然日内最新文件
+        - 7 日内均无文件且 require_exists=True 时抛 FileNotFoundError
         """
+        from datetime import timedelta
         d = target_date or date.today()
-        csv_path = (
-            Path(base_dir)
-            / "macro"
-            / "cgb_yield"
-            / f"cgb_yieldcurve_{d.strftime('%Y%m%d')}.csv"
-        )
-        if require_exists and not csv_path.exists():
-            raise FileNotFoundError(
-                f"未找到 {d.isoformat()} 的中债曲线文件: {csv_path}"
+        cgb_dir = Path(base_dir) / "macro" / "cgb_yield"
+
+        # 优先精确匹配当日文件
+        exact = cgb_dir / f"cgb_yieldcurve_{d.strftime('%Y%m%d')}.csv"
+        if exact.exists():
+            return cls.from_cgb_csv(exact, expected_date=d, require_date_match=True)
+
+        # 回退：7 日内最新文件
+        candidates = []
+        for i in range(1, 8):
+            fallback_d = d - timedelta(days=i)
+            p = cgb_dir / f"cgb_yieldcurve_{fallback_d.strftime('%Y%m%d')}.csv"
+            if p.exists():
+                candidates.append((fallback_d, p))
+        if candidates:
+            fallback_d, fallback_path = candidates[0]  # 最近的
+            import warnings
+            warnings.warn(
+                f"未找到 {d.isoformat()} 的中债曲线文件，使用最近可用日期 {fallback_d.isoformat()}",
+                UserWarning,
+                stacklevel=2,
             )
-        return cls.from_cgb_csv(csv_path, expected_date=d, require_date_match=True)
+            return cls.from_cgb_csv(fallback_path, expected_date=fallback_d, require_date_match=True)
+
+        if require_exists:
+            raise FileNotFoundError(
+                f"未找到 {d.isoformat()} 及前 7 日内的中债曲线文件，请执行: "
+                f"python -m data_engine.bond_termstructure_fetcher --kind cgb"
+            )
+        raise FileNotFoundError(f"无可用中债曲线文件: {cgb_dir}")
 
     @classmethod
     def from_cgb_row(
