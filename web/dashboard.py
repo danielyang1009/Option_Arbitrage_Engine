@@ -321,6 +321,8 @@ class MonitorStartRequest(BaseModel):
     n_each_side: int = 10
     zmq_port: int = 5555
     snapshot_dir: str = DEFAULT_MARKET_DATA_DIR
+    etf_fee_rate: float = 0.0002
+    option_one_side_fee: float = 1.5
 
 
 class DDEStartRequest(BaseModel):
@@ -733,18 +735,14 @@ def start_recorder(req: RecorderStartRequest) -> Dict[str, Any]:
 @app.post("/api/processes/monitor/start")
 def start_monitor(req: MonitorStartRequest) -> Dict[str, Any]:
     args = [
-        "--min-profit",
-        str(req.min_profit),
-        "--expiry-days",
-        str(req.expiry_days),
-        "--refresh",
-        str(req.refresh),
-        "--n-each-side",
-        str(req.n_each_side),
-        "--zmq-port",
-        str(req.zmq_port),
-        "--snapshot-dir",
-        req.snapshot_dir,
+        "--min-profit", str(req.min_profit),
+        "--expiry-days", str(req.expiry_days),
+        "--refresh", str(req.refresh),
+        "--n-each-side", str(req.n_each_side),
+        "--zmq-port", str(req.zmq_port),
+        "--snapshot-dir", req.snapshot_dir,
+        "--etf-fee-rate", str(req.etf_fee_rate),
+        "--option-one-side-fee", str(req.option_one_side_fee),
     ]
     return {"ok": True, "started": spawn_module("monitors.monitor", args)}
 

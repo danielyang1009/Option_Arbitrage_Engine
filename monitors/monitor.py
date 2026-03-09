@@ -139,12 +139,9 @@ def _build_etf_table(
         profit = sig.net_profit_estimate
         is_adj = sig.is_adjusted
 
-        if profit >= min_profit:
+        if profit > 0:
             profit_str = f"[bold green]{profit:.0f}[/bold green]"
             dir_str = "[bold green]正向[/bold green]"
-        elif profit >= 0:
-            profit_str = f"{profit:.0f}"
-            dir_str = "正向"
         else:
             profit_str = f"[dim]{profit:.0f}[/dim]"
             dir_str = ""
@@ -158,19 +155,7 @@ def _build_etf_table(
         net_1tick_str = f"{sig.net_1tick:.0f}" if sig.net_1tick is not None else "--"
         tolerance_str = f"{sig.tolerance:.2f}" if sig.tolerance is not None else "--"
 
-        risk_gray = (
-            (sig.max_qty is not None and sig.max_qty < 5)
-            or (sig.spread_ratio is not None and sig.spread_ratio > 0.10)
-            or (sig.tolerance is not None and sig.tolerance < 3.0)
-            or (sig.obi_c is not None and sig.obi_c < 0.2)
-            or (sig.obi_s is not None and sig.obi_s < 0.2)
-            or (sig.obi_p is not None and sig.obi_p < 0.2)
-        )
-        risk_red = (
-            (sig.spread_ratio is not None and sig.spread_ratio > 0.10)
-            or (sig.tolerance is not None and sig.tolerance < 1.0)
-        )
-        row_style = "black on bright_red" if risk_red else ("dim" if risk_gray else None)
+        row_style = None
 
         adj_tag = " [dim]A[/dim]" if is_adj else ""
         strike_str = f"{sig.strike:.2f}{adj_tag}"
@@ -278,6 +263,8 @@ def run_monitor(
     n_each_side: int = 10,
     zmq_port: int = 5555,
     snapshot_dir: str = DEFAULT_MARKET_DATA_DIR,
+    etf_fee_rate: float = 0.0002,
+    option_one_side_fee: float = 1.5,
 ) -> None:
     """ZMQ 订阅模式监控：从 data_bus 进程接收实时行情。"""
     try:
@@ -293,6 +280,8 @@ def run_monitor(
     from config.settings import get_default_config
     tmp_config = get_default_config()
     tmp_config.min_profit_threshold = min_profit
+    tmp_config.etf_fee_rate = etf_fee_rate
+    tmp_config.option_round_trip_fee = option_one_side_fee * 2
     tmp_strategy = PCPArbitrage(tmp_config)
     n_snap = restore_from_snapshot(tmp_strategy, snapshot_dir, etf_prices)
     if n_snap:
@@ -304,6 +293,8 @@ def run_monitor(
         strategy, contract_mgr, active, pairs, option_codes, etf_codes = (
             init_strategy_and_contracts(
                 min_profit, expiry_days, 1.0, etf_prices,  # 1.0=全量配对，显示由 n_each_side 控制
+                etf_fee_rate=etf_fee_rate,
+                option_round_trip_fee=option_one_side_fee * 2,
                 log_fn=lambda msg: console.print(msg),
             )
         )
@@ -324,7 +315,11 @@ def run_monitor(
     console.print(
         f"\n[bold green]ZMQ 模式监控已启动[/bold green]  "
         f"连接 tcp://127.0.0.1:{zmq_port}  "
-        f"收到新数据即刷新（空闲时每 {refresh_secs}s）  最小利润 {min_profit:.0f} 元  按 Ctrl+C 退出\n"
+        f"收到新数据即刷新（空闲时每 {refresh_secs}s）  最小利润 {min_profit:.0f} 元  按 Ctrl+C 退出"
+    )
+    console.print(
+        f"[dim]手续费：ETF {etf_fee_rate*10000:.1f}‱  期权单边 {option_one_side_fee:.2f} 元/张"
+        f"（双边 {option_one_side_fee*2:.2f} 元）[/dim]\n"
     )
 
     iteration = 0
@@ -462,6 +457,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--n-each-side", type=int, default=10, help="ATM 上下各显示 N 组（0=显示全部）")
     parser.add_argument("--zmq-port", type=int, default=5555, help="ZMQ PUB 端口")
     parser.add_argument("--snapshot-dir", type=str, default=DEFAULT_MARKET_DATA_DIR, help="快照文件目录")
+    parser.add_argument("--etf-fee-rate", type=float, default=0.0002, help="ETF 单边手续费率（默认 0.0002 即万2）")
+    parser.add_argument("--option-one-side-fee", type=float, default=1.5, help="期权单边手续费（元/张，默认 1.5）")
     return parser.parse_args()
 
 
@@ -474,4 +471,6 @@ if __name__ == "__main__":
         n_each_side=args.n_each_side,
         zmq_port=args.zmq_port,
         snapshot_dir=args.snapshot_dir,
+        etf_fee_rate=args.etf_fee_rate,
+        option_one_side_fee=args.option_one_side_fee,
     )
