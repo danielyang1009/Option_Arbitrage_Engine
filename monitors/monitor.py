@@ -15,7 +15,7 @@ import argparse
 import sys
 import time
 from collections import defaultdict
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
@@ -29,8 +29,10 @@ from rich import box
 from rich.console import Console, Group as RenderGroup
 from rich.live import Live
 from rich.panel import Panel
+from rich.rule import Rule
 from rich.table import Table
 
+from utils.time_utils import bj_today
 from monitors.common import (
     ETF_NAME_MAP,
     ETF_ORDER,
@@ -65,6 +67,17 @@ logging.basicConfig(
 # Rich 显示构建
 # ──────────────────────────────────────────────────────────────────────
 
+def _trading_days_until(expiry: date, today: date) -> int:
+    """从 today 到 expiry（含）的工作日数（周一~周五，不含节假日）。"""
+    count = 0
+    d = today
+    while d <= expiry:
+        if d.weekday() < 5:
+            count += 1
+        d += timedelta(days=1)
+    return count
+
+
 _ETF_BORDER = {
     "510050.SH": "bright_cyan",
     "510300.SH": "bright_blue",
@@ -85,122 +98,125 @@ def _build_etf_table(
     n_opts: int = 0,
     n_positive: int = 0,
     n_profitable: int = 0,
-) -> Table:
-    """为单个品种构建信号表格（固定显示 ATM 上下各 n_each_side 行）"""
+) -> Panel:
+    """为单个品种构建信号面板，每个到期日组显示跨列全宽横幅标题。"""
     u_name = ETF_NAME_MAP.get(underlying.split(".")[0], underlying)
     n_profitable_val = sum(1 for s in sigs if s.net_profit_estimate >= min_profit)
     border = "bright_green" if n_profitable_val > 0 else (_ETF_BORDER.get(underlying, "dim") if sigs else "dim")
 
-    # 第一行：品种名、价格、VIX
-    line1 = [f"[bold]{u_name}[/bold]"]
+    # 面板标题：品种名、价格、VIX
+    title_parts = [f"[bold]{u_name}[/bold]"]
     if price > 0:
-        line1.append(f"[yellow]{price:.4f}[/yellow]")
+        title_parts.append(f"[yellow]{price:.4f}[/yellow]")
     if vix_value is not None:
-        line1.append(f"[magenta]VIX {vix_value:.2f}[/magenta]")
+        title_parts.append(f"[magenta]VIX {vix_value:.2f}[/magenta]")
     if not sigs:
-        line1.append("[dim]暂无数据[/dim]")
+        title_parts.append("[dim]暂无数据[/dim]")
+    panel_title = "  ".join(title_parts)
 
-    # 第二行：监控配对、订阅期权、有效报价、正向机会(≥0)、高价值(≥min_profit)
-    line2 = (
+    # 面板副标题：统计信息（显示在面板底部边框）
+    panel_subtitle = (
         f"[dim]监控配对: {n_pairs} 组  订阅期权: {n_opts} 个  "
         f"有报价: {len(sigs)} 条  正向机会: {n_positive}  (≥{min_profit:.0f}元: {n_profitable})[/dim]"
     )
 
-    tbl = Table(
-        title="  ".join(line1) + "\n" + line2,
-        box=box.SIMPLE_HEAVY,
-        show_header=True,
-        header_style="bold cyan",
-        border_style=border,
-        expand=True,
-        padding=(0, 1),
-    )
-    tbl.add_column("到期",   style="dim", width=5,  justify="center")
-    tbl.add_column("行权价",             width=6,  justify="left")
-    tbl.add_column("方向",               width=4,  justify="center")
-    tbl.add_column("净利润",             width=7,  justify="right")
-    tbl.add_column("Max_Qty",           width=6,  justify="right")
-    tbl.add_column("SPRD",              width=5,  justify="right")
-    tbl.add_column("OBI_C",             width=5,  justify="right")
-    tbl.add_column("OBI_S",             width=5,  justify="right")
-    tbl.add_column("OBI_P",             width=5,  justify="right")
-    tbl.add_column("Net_1T",           width=7,  justify="right")
-    tbl.add_column("TOL",              width=6,  justify="right")
-    tbl.add_column("C_b",               width=7,  justify="right")
-    tbl.add_column("P_a",               width=7,  justify="right")
-    tbl.add_column("S",                 width=7,  justify="right")
-    tbl.add_column("乘数",               width=6,  justify="right")
-
-    if not sigs:
-        tbl.add_row(*["—"] * 15)
+    def _make_table(show_header: bool) -> Table:
+        tbl = Table(
+            box=box.SIMPLE_HEAVY,
+            show_header=show_header,
+            header_style="bold cyan",
+            show_edge=False,
+            expand=True,
+            padding=(0, 1),
+        )
+        tbl.add_column("行权价", width=6,  justify="left")
+        tbl.add_column("方向",   width=4,  justify="center")
+        tbl.add_column("净利润", width=7,  justify="right")
+        tbl.add_column("Max_Qty", width=6, justify="right")
+        tbl.add_column("SPRD",   width=5,  justify="right")
+        tbl.add_column("OBI_C",  width=5,  justify="right")
+        tbl.add_column("OBI_S",  width=5,  justify="right")
+        tbl.add_column("OBI_P",  width=5,  justify="right")
+        tbl.add_column("Net_1T", width=7,  justify="right")
+        tbl.add_column("TOL",    width=6,  justify="right")
+        tbl.add_column("C_b",    width=7,  justify="right")
+        tbl.add_column("P_a",    width=7,  justify="right")
+        tbl.add_column("S",      width=7,  justify="right")
+        tbl.add_column("乘数",   width=6,  justify="right")
         return tbl
 
-    def _add_sig_row(sig: TradeSignal) -> None:
+    def _add_sig_row(tbl: Table, sig: TradeSignal) -> None:
         profit = sig.net_profit_estimate
-        is_adj = sig.is_adjusted
-
         if profit > 0:
             profit_str = f"[bold green]{profit:.0f}[/bold green]"
             dir_str = "[bold green]正向[/bold green]"
         else:
             profit_str = f"[dim]{profit:.0f}[/dim]"
             dir_str = ""
-
-        mult_str = str(sig.multiplier)
-        max_qty_str = f"{sig.max_qty:.2f}" if sig.max_qty is not None else "--"
-        spread_str = f"{sig.spread_ratio * 100:.1f}%" if sig.spread_ratio is not None else "--"
-        obi_c_str = f"{sig.obi_c:.2f}" if sig.obi_c is not None else "--"
-        obi_s_str = f"{sig.obi_s:.2f}" if sig.obi_s is not None else "--"
-        obi_p_str = f"{sig.obi_p:.2f}" if sig.obi_p is not None else "--"
-        net_1tick_str = f"{sig.net_1tick:.0f}" if sig.net_1tick is not None else "--"
-        tolerance_str = f"{sig.tolerance:.2f}" if sig.tolerance is not None else "--"
-
-        row_style = None
-
-        adj_tag = " [dim]A[/dim]" if is_adj else ""
-        strike_str = f"{sig.strike:.2f}{adj_tag}"
-
+        adj_tag = " [dim]A[/dim]" if sig.is_adjusted else ""
         tbl.add_row(
-            sig.expiry.strftime("%m-%d"),
-            strike_str,
+            f"{sig.strike:.2f}{adj_tag}",
             dir_str,
             profit_str,
-            max_qty_str,
-            spread_str,
-            obi_c_str,
-            obi_s_str,
-            obi_p_str,
-            net_1tick_str,
-            tolerance_str,
+            f"{sig.max_qty:.2f}" if sig.max_qty is not None else "--",
+            f"{sig.spread_ratio * 100:.1f}%" if sig.spread_ratio is not None else "--",
+            f"{sig.obi_c:.2f}" if sig.obi_c is not None else "--",
+            f"{sig.obi_s:.2f}" if sig.obi_s is not None else "--",
+            f"{sig.obi_p:.2f}" if sig.obi_p is not None else "--",
+            f"{sig.net_1tick:.0f}" if sig.net_1tick is not None else "--",
+            f"{sig.tolerance:.2f}" if sig.tolerance is not None else "--",
             f"{sig.call_bid:.4f}",
             f"{sig.put_ask:.4f}",
             f"{sig.spot_price:.4f}",
-            mult_str,
-            style=row_style,
+            str(sig.multiplier),
         )
 
+    if not sigs:
+        tbl = _make_table(show_header=True)
+        tbl.add_row(*["—"] * 14)
+        return Panel(tbl, title=panel_title, subtitle=panel_subtitle,
+                     border_style=border, expand=True, padding=(0, 1))
+
+    today = bj_today()
     by_expiry: Dict[date, List[TradeSignal]] = defaultdict(list)
     for sig in sigs:
         by_expiry[sig.expiry].append(sig)
 
-    first_group = True
-    for expiry in sorted(by_expiry):
+    renderables: List = []
+    for i, expiry in enumerate(sorted(by_expiry)):
         group = by_expiry[expiry]
         normal = sorted([s for s in group if not s.is_adjusted], key=lambda s: s.strike)
         adjusted = sorted([s for s in group if s.is_adjusted], key=lambda s: s.strike)
 
-        if not first_group:
-            tbl.add_section()
-        first_group = False
+        cal_days = (expiry - today).days
+        trade_days = _trading_days_until(expiry, today)
+        mult_rep = group[0].multiplier
 
+        # 全宽横幅标题（Rule 组件天然跨满所有列）
+        rule_title = (
+            f"[bold]{expiry.strftime('%Y-%m-%d')}[/bold]"
+            f"  [dim]自然日 {cal_days}天  交易日 {trade_days}天  ×{mult_rep}[/dim]"
+        )
+        renderables.append(Rule(rule_title, style="cyan", align="left"))
+
+        # 第一个到期组显示列名，后续组省略（列名对所有组通用）
+        tbl = _make_table(show_header=(i == 0))
         for sig in normal:
-            _add_sig_row(sig)
+            _add_sig_row(tbl, sig)
         if adjusted and normal:
             tbl.add_section()
         for sig in adjusted:
-            _add_sig_row(sig)
+            _add_sig_row(tbl, sig)
+        renderables.append(tbl)
 
-    return tbl
+    return Panel(
+        RenderGroup(*renderables),
+        title=panel_title,
+        subtitle=panel_subtitle,
+        border_style=border,
+        expand=True,
+        padding=(0, 1),
+    )
 
 
 def build_display(
