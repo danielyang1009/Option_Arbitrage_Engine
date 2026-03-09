@@ -155,17 +155,17 @@ function renderMetadataFiles(mf){
     el.innerHTML = "";
     return;
   }
-  const oc = mf.wind_50etf_optionchain;
-  const wxy = mf.wxy_50etf;
-  const lines = [];
-  if(oc){
-    const s = oc.mtime_ago === "文件不存在" ? "badge-down" : "badge-ok";
-    lines.push(`<div class="kv" style="margin:2px 0">wind_50etf_optionchain.xlsx <span class="badge ${s}">${oc.mtime_ago}</span></div>`);
-  }
-  if(wxy){
-    const s = wxy.mtime_ago === "文件不存在" ? "badge-down" : "badge-ok";
-    lines.push(`<div class="kv" style="margin:2px 0">wxy_50etf.xlsx <span class="badge ${s}">${wxy.mtime_ago}</span></div>`);
-  }
+  const files = [
+    ["wind_sse_optionchain.xlsx", mf.wind_sse_optionchain],
+    ["wxy_50etf.xlsx",            mf.wxy_50etf],
+    ["wxy_300etf.xlsx",           mf.wxy_300etf],
+    ["wxy_500etf.xlsx",           mf.wxy_500etf],
+  ];
+  const lines = files.map(([name, info]) => {
+    const ago = info ? info.mtime_ago : "未找到";
+    const s = (!info || ago === "未找到" || ago === "文件不存在") ? "badge-down" : "badge-ok";
+    return `<div class="kv" style="margin:2px 0">${name} <span class="badge ${s}">${ago}</span></div>`;
+  });
   el.innerHTML = lines.join("");
 }
 

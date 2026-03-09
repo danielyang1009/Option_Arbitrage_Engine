@@ -144,7 +144,7 @@ def _build_etf_table(
 
     def _make_table(show_header: bool) -> Table:
         tbl = Table(
-            box=box.SIMPLE_HEAVY,
+            box=box.SIMPLE,
             show_header=show_header,
             header_style="bold cyan",
             show_edge=False,
@@ -155,23 +155,26 @@ def _build_etf_table(
         tbl.add_column("方向",   width=4,  justify="center")
         tbl.add_column("净利润", width=7,  justify="right")
         tbl.add_column("Net_1T", width=7,  justify="right")
-        tbl.add_column("TOL",    width=6,  justify="right")
-        tbl.add_column("Max_Qty", width=6, justify="right")
+        tbl.add_column("TOL",    width=5,  justify="right")
+        tbl.add_column("Max_Qty", width=5, justify="right")
         tbl.add_column("SPRD",   width=5,  justify="right")
-        tbl.add_column("OBI_C",  width=5,  justify="right")
-        tbl.add_column("OBI_P",  width=5,  justify="right")
-        tbl.add_column("OBI_S",  width=5,  justify="right")
-        tbl.add_column("C_b",    width=7,  justify="right")
-        tbl.add_column("P_a",    width=7,  justify="right")
-        tbl.add_column("S_a",    width=7,  justify="right")
+        tbl.add_column("OBI_C",  width=4,  justify="right")
+        tbl.add_column("OBI_P",  width=4,  justify="right")
+        tbl.add_column("OBI_S",  width=4,  justify="right")
+        tbl.add_column("C_b",    width=6,  justify="right")
+        tbl.add_column("P_a",    width=6,  justify="right")
+        tbl.add_column("S_a",    width=6,  justify="right")
         # 乘数列已移至每组 Rule 标题，此处不再单独列出
         return tbl
 
     def _add_sig_row(tbl: Table, sig: TradeSignal) -> None:
         profit = sig.net_profit_estimate
-        if profit > 0:
+        if profit >= min_profit:
             profit_str = f"[bold green]{profit:.0f}[/bold green]"
             dir_str = "[bold green]正向[/bold green]"
+        elif profit >= 0:
+            profit_str = f"[white]{profit:.0f}[/white]"
+            dir_str = "[white]正向[/white]"
         else:
             profit_str = f"[dim]{profit:.0f}[/dim]"
             dir_str = ""
@@ -196,7 +199,7 @@ def _build_etf_table(
         tbl = _make_table(show_header=True)
         tbl.add_row(*["—"] * 13)
         return Panel(tbl, title=panel_title, subtitle=panel_subtitle,
-                     border_style=border, expand=True, padding=(0, 1))
+                     border_style=border, expand=True, padding=(0, 0))
 
     today = bj_today()
 
@@ -232,7 +235,7 @@ def _build_etf_table(
         subtitle=panel_subtitle,
         border_style=border,
         expand=True,
-        padding=(0, 1),
+        padding=(0, 0),
     )
 
 
@@ -252,7 +255,7 @@ def build_display(
         f"[bold bright_green]⚡ DeltaZero 正向套利监控[/bold bright_green]  "
         f"[dim]{ts.strftime('%H:%M:%S')}[/dim]  第 {iteration} 次刷新",
         box=box.MINIMAL,
-        padding=(0, 2),
+        padding=(0, 1),
     )
 
     # 按品种分组，再各自按 ATM 上下各取 n_each_side

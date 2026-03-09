@@ -32,7 +32,7 @@ logger = logging.getLogger(__name__)
 
 _NS_MAIN = {"s": "http://schemas.openxmlformats.org/spreadsheetml/2006/main"}
 _COL_RE = re.compile(r"([A-Z]+)")
-_WIND_CHAIN_GLOB = "metadata/wind_*_optionchain.xlsx"
+_WIND_CHAIN_GLOB = "metadata/wind_sse_optionchain.xlsx"
 
 _HEALTH_ACTIVE = "ACTIVE"
 _HEALTH_STALE = "STALE"
@@ -50,7 +50,7 @@ class DDESubscriber(DataProvider):
         products: List[str],
         tick_queue: Queue,
         poll_interval: float = 3.0,
-        staleness_timeout: float = 30.0,
+        staleness_timeout: float = 90.0,
         mode: str = "advise",
     ) -> None:
         self._products = list(products)
@@ -539,7 +539,7 @@ class DDESubscriber(DataProvider):
             self._code_multiplier.setdefault(norm_code, 10000)
 
     def _load_optionchain_info(self) -> None:
-        """从 wind_*_optionchain.xlsx 补充 is_adjusted/multiplier。"""
+        """从 wind_sse_optionchain.xlsx 补充 is_adjusted/multiplier。"""
         files = sorted(glob.glob(_WIND_CHAIN_GLOB))
         if not files:
             return
