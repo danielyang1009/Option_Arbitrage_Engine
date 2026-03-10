@@ -17,10 +17,19 @@ python console.py
 ## 日常流程
 
 1. 打开 Wind 或交易软件（DDE）。
-2. 在控制台执行“抓取今日期权链”。
+2. 在控制台执行”抓取今日期权链”。
 3. 启动 DataBus（Wind 或 DDE）。
 4. 启动 Monitor。
-5. 收盘后执行“合并今日分片”并关闭进程。
+5. 收盘后执行”合并今日分片”并关闭进程。
+
+### DDE 启动前置步骤
+
+通达信 DDE Server 为懒启动，必须先用 Excel 激活，DDEBus 才能连接：
+
+1. 启动通达信
+2. 打开 `metadata/wxy_options.xlsx`，等待数据刷新几秒
+3. 关闭 Excel
+4. 启动 DDEBus
 
 ## 关键命令
 
@@ -55,6 +64,7 @@ python -m monitors.monitor --zmq-port 5555
 
 ## 数据目录约定
 
+- DDE 路由表：`metadata/wxy_options.xlsx`，含 3 个 Sheet（`50etf` / `300etf` / `500etf`），每个 Sheet 同时包含对应 ETF 及全部期权合约，换月时在对应 Sheet 更新行权价行即可
 - 默认市场数据目录固定为：`D:\MARKET_DATA`
 - DataBus 的快照、分片、日合并文件均写入该目录（按品种子目录存储）：
   - `D:\MARKET_DATA\snapshot_latest.parquet`（全量，Monitor 冷启动用）

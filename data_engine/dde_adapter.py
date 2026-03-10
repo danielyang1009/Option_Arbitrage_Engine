@@ -186,7 +186,11 @@ class DDERouteParser:
     def parse(self) -> Dict[str, str]:
         """解析全部 Excel，并返回 contract_code -> topic。"""
         merged: Dict[str, RouteEntry] = {}
+        seen_paths: set = set()
         for asset, file_path in self.excel_files.items():
+            if file_path in seen_paths:
+                continue
+            seen_paths.add(file_path)
             path = Path(file_path)
             if not path.exists():
                 self.logger.warning("映射文件不存在，跳过: %s (%s)", path, asset)

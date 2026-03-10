@@ -3,6 +3,9 @@
 """DeltaZero 统一控制台入口。"""
 from __future__ import annotations
 
+import os
+os.environ.setdefault("NUMEXPR_MAX_THREADS", "16")
+
 import argparse
 import logging
 import sys

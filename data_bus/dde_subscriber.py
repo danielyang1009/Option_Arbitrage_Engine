@@ -613,6 +613,12 @@ class DDESubscriber(DataProvider):
 
     @staticmethod
     def _build_default_dde_excel_files(products: List[str]) -> Dict[str, str]:
+        # 优先新版合并文件
+        consolidated = Path("metadata/wxy_options.xlsx")
+        if consolidated.exists():
+            return {p: str(consolidated) for p in products
+                    if p in ("510050.SH", "510300.SH", "510500.SH")}
+        # 回退旧的3文件模式
         candidate_map = {
             "510050.SH": "metadata/wxy_50etf.xlsx",
             "510300.SH": "metadata/wxy_300etf.xlsx",

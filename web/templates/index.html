@@ -157,9 +157,7 @@ function renderMetadataFiles(mf){
   }
   const files = [
     ["wind_sse_optionchain.xlsx", mf.wind_sse_optionchain],
-    ["wxy_50etf.xlsx",            mf.wxy_50etf],
-    ["wxy_300etf.xlsx",           mf.wxy_300etf],
-    ["wxy_500etf.xlsx",           mf.wxy_500etf],
+    ["wxy_options.xlsx",           mf.wxy_options],
   ];
   const lines = files.map(([name, info]) => {
     const ago = info ? info.mtime_ago : "未找到";

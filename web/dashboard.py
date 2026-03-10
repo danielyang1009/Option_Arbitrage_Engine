@@ -557,10 +557,6 @@ def dde_state() -> Dict[str, Any]:
     return {
         "running": running,
         "route_count": route_count,
-        "optionchain_mtime": _wind_optionchain_mtime_ago(),
-        "wxy_50etf_mtime": _file_mtime_ago(_METADATA_DIR / "wxy_50etf.xlsx"),
-        "wxy_300etf_mtime": _file_mtime_ago(_METADATA_DIR / "wxy_300etf.xlsx"),
-        "wxy_500etf_mtime": _file_mtime_ago(_METADATA_DIR / "wxy_500etf.xlsx"),
         "data_mode": "databus" if recorder_source else "direct_dde",
         "recorder_source": recorder_source,
     }
@@ -717,9 +713,7 @@ def get_state() -> Dict[str, Any]:
         "market_data_dir": DEFAULT_MARKET_DATA_DIR,
         "metadata_files": {
             "wind_sse_optionchain": {"mtime_ago": _wind_optionchain_mtime_ago()},
-            "wxy_50etf":  {"mtime_ago": _file_mtime_ago(_METADATA_DIR / "wxy_50etf.xlsx")},
-            "wxy_300etf": {"mtime_ago": _file_mtime_ago(_METADATA_DIR / "wxy_300etf.xlsx")},
-            "wxy_500etf": {"mtime_ago": _file_mtime_ago(_METADATA_DIR / "wxy_500etf.xlsx")},
+            "wxy_options": {"mtime_ago": _file_mtime_ago(_METADATA_DIR / "wxy_options.xlsx")},
         },
         "bond_files": _bond_files_info(),
     }
