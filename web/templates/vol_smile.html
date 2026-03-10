@@ -12,17 +12,29 @@ h1{margin:0 0 12px;font-size:20px}
 .controls{display:flex;gap:12px;flex-wrap:wrap;align-items:center;background:#fff;border:1px solid #dde1ea;border-radius:10px;padding:12px 16px;margin-bottom:12px}
 .controls label{font-size:13px;color:#475569;margin-right:4px}
 .controls select,.controls input{padding:4px 8px;border:1px solid #cbd5e1;border-radius:6px;font-size:13px}
-.controls input[type=number]{width:70px}
-.btn-sm{padding:4px 10px;font-size:12px}
-.chart-card{background:#fff;border:1px solid #dde1ea;border-radius:10px;padding:16px;position:relative}
+.chart-card{background:#fff;border:1px solid #dde1ea;border-radius:10px;padding:16px;margin-bottom:12px;position:relative}
+.table-card{background:#fff;border:1px solid #dde1ea;border-radius:10px;padding:16px}
 #statusBar{font-size:12px;color:#64748b;margin-top:8px;text-align:right}
+#wsStatus{font-size:12px;font-weight:600;margin-left:8px}
+#wsStatus.connected{color:#16a34a}
+#wsStatus.disconnected{color:#dc2626}
 #errorMsg{font-size:13px;color:#dc2626;margin-top:8px;display:none}
-#loadingMsg{font-size:13px;color:#2563eb;margin-top:8px;display:none}
-#chartContainer{position:relative;height:460px}
+#chartContainer{position:relative;height:420px}
+#ivTable{width:100%;border-collapse:collapse;font-size:12px}
+#ivTable th{background:#f8fafc;padding:5px 8px;text-align:right;border-bottom:2px solid #e2e8f0;white-space:nowrap}
+#ivTable th:first-child{text-align:center}
+#ivTable td{padding:4px 8px;text-align:right;border-bottom:1px solid #f1f5f9}
+#ivTable td:first-child{text-align:center;font-weight:600}
+#ivTable tr.alert-pcp td{background:#fef9c3}
+#ivTable tr.alert-skew td{background:#fee2e2}
+#ivTable tr.atm-row td{background:#eff6ff;font-weight:600}
+.iv-call{color:#ef4444}
+.iv-put{color:#16a34a}
+.spread{color:#94a3b8;font-size:11px}
 </style>
 </head>
 <body>
-<h1>📈 波动率微笑</h1>
+<h1>📈 波动率微笑 <span id="wsStatus" class="disconnected">● 未连接</span></h1>
 
 <div class="controls">
   <span>
@@ -39,14 +51,18 @@ h1{margin:0 0 12px;font-size:20px}
   </span>
   <span>
     <label>合约类型</label>
-    <select id="selAdjusted" onchange="restartPolling()">
+    <select id="selAdjusted">
       <option value="false">标准合约</option>
       <option value="true">调整合约</option>
     </select>
   </span>
   <span>
-    <label>刷新间隔</label>
-    <input id="inpInterval" type="number" value="5" min="1" max="60"/>秒
+    <label>PCP阈值</label>
+    <input id="inpPcpThr" type="number" value="0.003" min="0" step="0.001" style="width:72px"/>
+  </span>
+  <span>
+    <label>Skew阈值</label>
+    <input id="inpSkewThr" type="number" value="0.02" min="0" step="0.005" style="width:72px"/>
   </span>
 </div>
 
@@ -54,16 +70,50 @@ h1{margin:0 0 12px;font-size:20px}
   <div id="chartContainer">
     <canvas id="smileChart"></canvas>
   </div>
-  <div id="loadingMsg">加载中...</div>
   <div id="errorMsg"></div>
   <div id="statusBar">—</div>
 </div>
 
+<div class="table-card">
+  <table id="ivTable">
+    <thead>
+      <tr>
+        <th>行权价</th>
+        <th class="iv-call">Call IV</th>
+        <th class="iv-call">Call Bid/Ask IV</th>
+        <th class="iv-put">Put IV</th>
+        <th class="iv-put">Put Bid/Ask IV</th>
+        <th>IV Skew (C-P)</th>
+        <th>PCP偏差</th>
+      </tr>
+    </thead>
+    <tbody id="ivTableBody"></tbody>
+  </table>
+</div>
+
 <script>
 let chart = null;
-let timerId = null;
-let _spotLine = null;
+let _pendingData = null, _rafId = null;
+let _prevTable = {};
+let _latestMsg = null;
+let _allExpiries = [];
+let _adjustedExpiries = new Set();
 
+const selUnderlying = document.getElementById('selUnderlying');
+const selExpiry     = document.getElementById('selExpiry');
+const selAdjusted   = document.getElementById('selAdjusted');
+const statusBar     = document.getElementById('statusBar');
+const wsStatusEl    = document.getElementById('wsStatus');
+const errorMsgEl    = document.getElementById('errorMsg');
+
+function getCFG() {
+  return {
+    pcp_threshold:  parseFloat(document.getElementById('inpPcpThr').value)  || 0.003,
+    skew_threshold: parseFloat(document.getElementById('inpSkewThr').value) || 0.02,
+  };
+}
+
+// ── 图表初始化 ────────────────────────────────────────────
 function initChart() {
   const ctx = document.getElementById('smileChart').getContext('2d');
   chart = new Chart(ctx, {
@@ -71,24 +121,20 @@ function initChart() {
     data: {
       datasets: [
         {
-          label: 'Call',
+          label: 'Call IV',
           data: [],
           borderColor: '#ef4444',
           backgroundColor: 'rgba(239,68,68,0.08)',
-          pointRadius: 4,
-          pointHoverRadius: 6,
-          tension: 0.3,
-          borderWidth: 2,
+          pointRadius: 4, pointHoverRadius: 6,
+          tension: 0.3, borderWidth: 2,
         },
         {
-          label: 'Put',
+          label: 'Put IV',
           data: [],
           borderColor: '#16a34a',
           backgroundColor: 'rgba(22,163,74,0.08)',
-          pointRadius: 4,
-          pointHoverRadius: 6,
-          tension: 0.3,
-          borderWidth: 2,
+          pointRadius: 4, pointHoverRadius: 6,
+          tension: 0.3, borderWidth: 2,
         },
       ]
     },
@@ -103,7 +149,6 @@ function initChart() {
             label: ctx => `${ctx.dataset.label}: ${(ctx.parsed.y * 100).toFixed(2)}%`,
           }
         },
-        annotation: {},
       },
       scales: {
         x: {
@@ -120,38 +165,7 @@ function initChart() {
   });
 }
 
-function updateChart(data) {
-  if (!chart) return;
-
-  const callPts = (data.calls || []).map(d => ({ x: d.strike, y: d.iv }));
-  const putPts  = (data.puts  || []).map(d => ({ x: d.strike, y: d.iv }));
-
-  chart.data.datasets[0].data = callPts;
-  chart.data.datasets[1].data = putPts;
-
-  // spot 竖线（用注释插件 annotation 或画在 afterDraw）
-  chart.options._spotVal = data.spot;
-
-  // 动态调整 y 轴范围
-  const allIVs = [...callPts, ...putPts].map(p => p.y).filter(v => v != null && isFinite(v));
-  if (allIVs.length > 0) {
-    const minIV = Math.max(0, Math.min(...allIVs) - 0.02);
-    const maxIV = Math.max(...allIVs) + 0.02;
-    chart.options.scales.y.min = minIV;
-    chart.options.scales.y.max = maxIV;
-  }
-
-  chart.update();
-  drawSpotLine(data.spot);
-}
-
-function drawSpotLine(spot) {
-  if (!chart || spot == null) return;
-  // 在 afterDraw 中绘制 spot 竖线
-  chart._spotVal = spot;
-}
-
-// 自定义插件：在图表上绘制 spot 竖线
+// 自定义插件：spot 竖线
 const spotLinePlugin = {
   id: 'spotLine',
   afterDraw(chart) {
@@ -178,33 +192,181 @@ const spotLinePlugin = {
 };
 Chart.register(spotLinePlugin);
 
-function getAdjusted() {
-  return document.getElementById('selAdjusted').value; // "true" or "false"
+function updateChart(ed, spot) {
+  if (!chart) return;
+  const contracts = ed.contracts || [];
+  const callPts = contracts.filter(c => c.type === 'C' && c.iv != null).map(c => ({ x: c.strike, y: c.iv }));
+  const putPts  = contracts.filter(c => c.type === 'P' && c.iv != null).map(c => ({ x: c.strike, y: c.iv }));
+
+  chart.data.datasets[0].data = callPts;
+  chart.data.datasets[1].data = putPts;
+  chart._spotVal = spot;
+
+  const allIVs = [...callPts, ...putPts].map(p => p.y).filter(v => v != null && isFinite(v));
+  if (allIVs.length > 0) {
+    chart.options.scales.y.min = Math.max(0, Math.min(...allIVs) - 0.02);
+    chart.options.scales.y.max = Math.max(...allIVs) + 0.02;
+  }
+  chart.update('none');
 }
 
-// 记录哪些到期日有调整合约
-let _adjustedExpiries = new Set();
+// ── IV 表格增量更新 ──────────────────────────────────────
+function updateTableFull(ed, atmStrike) {
+  const contracts = ed.contracts || [];
+  const CFG = getCFG();
+  const tbody = document.getElementById('ivTableBody');
 
-function updateAdjustedSelector() {
-  const expiry = document.getElementById('selExpiry').value;
-  const sel = document.getElementById('selAdjusted');
-  const adjOpt = sel.querySelector('option[value="true"]');
-  if (!adjOpt) return;
-  const hasAdj = _adjustedExpiries.has(expiry);
-  adjOpt.hidden = !hasAdj;
-  adjOpt.disabled = !hasAdj;
-  if (!hasAdj && sel.value === 'true') {
-    sel.value = 'false';
+  // 按行权价聚合（合并 Call 和 Put 行）
+  const byStrike = {};
+  for (const c of contracts) {
+    if (!byStrike[c.strike]) byStrike[c.strike] = {};
+    byStrike[c.strike][c.type] = c;
+  }
+
+  const strikes = Object.keys(byStrike).map(Number).sort((a, b) => a - b);
+
+  // 检查是否已有完整表格（行数相同则增量更新，否则重建）
+  const existingRows = tbody.querySelectorAll('tr');
+  if (existingRows.length !== strikes.length) {
+    tbody.innerHTML = '';
+    for (const k of strikes) {
+      const tr = document.createElement('tr');
+      tr.id = `row_${k}`;
+      tr.innerHTML = `<td>${k.toFixed(3)}</td><td id="c_civ_${k}">-</td><td id="c_cbidask_${k}" class="spread">-</td><td id="c_piv_${k}">-</td><td id="c_pbidask_${k}" class="spread">-</td><td id="c_skew_${k}">-</td><td id="c_pcp_${k}">-</td>`;
+      tbody.appendChild(tr);
+    }
+    _prevTable = {};
+  }
+
+  for (const k of strikes) {
+    const grp = byStrike[k];
+    const C = grp['C'];
+    const P = grp['P'];
+    const key = String(k);
+    const prev = _prevTable[key] || {};
+
+    const row = document.getElementById(`row_${k}`);
+    if (!row) continue;
+
+    // ATM 高亮
+    row.classList.toggle('atm-row', k === atmStrike);
+
+    // PCP / Skew 告警（用 Call 行的 pcp_dev 和 iv_skew）
+    const pcp_dev  = C ? C.pcp_dev  : null;
+    const iv_skew  = P ? P.iv_skew  : null;
+    row.classList.toggle('alert-pcp',  pcp_dev  != null && Math.abs(pcp_dev)  > CFG.pcp_threshold);
+    row.classList.toggle('alert-skew', iv_skew  != null && Math.abs(iv_skew)  > CFG.skew_threshold);
+
+    // Call IV
+    const civ_str = C && C.iv != null ? (C.iv * 100).toFixed(2) + '%' : '-';
+    if (civ_str !== (prev.civ || '')) {
+      document.getElementById(`c_civ_${k}`).textContent = civ_str;
+      prev.civ = civ_str;
+    }
+    // Call Bid/Ask IV
+    const cbidask_str = (C && C.bid_iv != null && C.ask_iv != null)
+      ? `${(C.bid_iv*100).toFixed(2)}/${(C.ask_iv*100).toFixed(2)}` : '-';
+    if (cbidask_str !== (prev.cbidask || '')) {
+      document.getElementById(`c_cbidask_${k}`).textContent = cbidask_str;
+      prev.cbidask = cbidask_str;
+    }
+    // Put IV
+    const piv_str = P && P.iv != null ? (P.iv * 100).toFixed(2) + '%' : '-';
+    if (piv_str !== (prev.piv || '')) {
+      document.getElementById(`c_piv_${k}`).textContent = piv_str;
+      prev.piv = piv_str;
+    }
+    // Put Bid/Ask IV
+    const pbidask_str = (P && P.bid_iv != null && P.ask_iv != null)
+      ? `${(P.bid_iv*100).toFixed(2)}/${(P.ask_iv*100).toFixed(2)}` : '-';
+    if (pbidask_str !== (prev.pbidask || '')) {
+      document.getElementById(`c_pbidask_${k}`).textContent = pbidask_str;
+      prev.pbidask = pbidask_str;
+    }
+    // IV Skew
+    const skew_str = iv_skew != null ? (iv_skew * 100).toFixed(2) + '%' : '-';
+    if (skew_str !== (prev.skew || '')) {
+      document.getElementById(`c_skew_${k}`).textContent = skew_str;
+      prev.skew = skew_str;
+    }
+    // PCP 偏差
+    const pcp_str = pcp_dev != null ? pcp_dev.toFixed(4) : '-';
+    if (pcp_str !== (prev.pcp || '')) {
+      document.getElementById(`c_pcp_${k}`).textContent = pcp_str;
+      prev.pcp = pcp_str;
+    }
+
+    _prevTable[key] = prev;
   }
 }
 
+// ── rAF 批渲染 ────────────────────────────────────────────
+function scheduleRender(richMsg) {
+  _pendingData = richMsg;
+  if (!_rafId) _rafId = requestAnimationFrame(doRender);
+}
+
+function doRender() {
+  _rafId = null;
+  const msg = _pendingData; _pendingData = null;
+  if (!msg || !msg.data) return;
+
+  const underlying = selUnderlying.value;
+  const expiry     = selExpiry.value;
+  const adjusted   = selAdjusted.value === 'true';
+
+  const ul = msg.data[underlying];
+  if (!ul) return;
+
+  // 同步到期日列表
+  const newExpiries = Object.keys(ul.expiries || {}).sort();
+  if (JSON.stringify(newExpiries) !== JSON.stringify(_allExpiries)) {
+    _allExpiries = newExpiries;
+    const curExpiry = selExpiry.value;
+    selExpiry.innerHTML = newExpiries.map(e => `<option value="${e}">${e}</option>`).join('');
+    if (newExpiries.includes(curExpiry)) selExpiry.value = curExpiry;
+    else _prevTable = {};
+  }
+
+  const curExpiry = selExpiry.value;
+  if (!curExpiry || !ul.expiries[curExpiry]) return;
+
+  const ed = ul.expiries[curExpiry];
+  updateChart(ed, ul.spot);
+  updateTableFull(ed, ed.atm_strike);
+
+  statusBar.textContent = `${new Date(msg.ts).toLocaleTimeString()} | Spot ${ul.spot != null ? ul.spot.toFixed(4) : '-'} | F ${ed.F != null ? ed.F.toFixed(4) : '-'} | ATM ${ed.atm_strike ?? '-'} | T ${ed.T_days != null ? ed.T_days.toFixed(1) + 'd' : '-'} | r ${ed.r != null ? (ed.r*100).toFixed(2)+'%' : '-'}`;
+}
+
+// ── WebSocket 连接（自动重连）────────────────────────────
+function connectWS() {
+  const ws = new WebSocket(`ws://${location.host}/ws/vol_smile`);
+  ws.onopen = () => {
+    wsStatusEl.textContent = '● 已连接';
+    wsStatusEl.className = 'connected';
+    errorMsgEl.style.display = 'none';
+  };
+  ws.onmessage = e => {
+    _latestMsg = JSON.parse(e.data);
+    scheduleRender(_latestMsg);
+  };
+  ws.onclose = () => {
+    wsStatusEl.textContent = '● 已断开';
+    wsStatusEl.className = 'disconnected';
+    setTimeout(connectWS, 2000);
+  };
+  ws.onerror = () => {
+    wsStatusEl.textContent = '● 连接错误';
+    wsStatusEl.className = 'disconnected';
+  };
+}
+
+// ── 到期日列表加载（用于首次初始化下拉框）────────────────
 async function loadExpiries() {
-  const underlying = document.getElementById('selUnderlying').value;
-  const sel = document.getElementById('selExpiry');
-  sel.innerHTML = '<option value="">-- 加载中 --</option>';
+  const underlying = selUnderlying.value;
+  selExpiry.innerHTML = '<option value="">-- 加载中 --</option>';
   _adjustedExpiries = new Set();
   try {
-    // 并行拉取标准和调整合约的到期日
     const [rStd, rAdj] = await Promise.all([
       fetch(`/api/vol_smile/expiries?underlying=${encodeURIComponent(underlying)}&adjusted=false`),
       fetch(`/api/vol_smile/expiries?underlying=${encodeURIComponent(underlying)}&adjusted=true`),
@@ -213,92 +375,42 @@ async function loadExpiries() {
     const stdExpiries = (dStd.ok && dStd.expiries) ? dStd.expiries : [];
     const adjExpiries = (dAdj.ok && dAdj.expiries) ? dAdj.expiries : [];
     _adjustedExpiries = new Set(adjExpiries);
+    const adjOpt = selAdjusted.querySelector('option[value="true"]');
+    if (adjOpt) {
+      adjOpt.hidden = _adjustedExpiries.size === 0;
+      adjOpt.disabled = _adjustedExpiries.size === 0;
+    }
     if (!stdExpiries.length) {
-      sel.innerHTML = '<option value="">暂无数据</option>';
+      selExpiry.innerHTML = '<option value="">暂无数据</option>';
       return;
     }
-    sel.innerHTML = stdExpiries.map(e => `<option value="${e}">${e}</option>`).join('');
-    updateAdjustedSelector();
-    restartPolling();
+    selExpiry.innerHTML = stdExpiries.map(e => `<option value="${e}">${e}</option>`).join('');
   } catch(e) {
-    sel.innerHTML = '<option value="">加载失败</option>';
+    selExpiry.innerHTML = '<option value="">加载失败</option>';
   }
 }
 
-function restartPolling() {
-  stopPolling();
-  const expiry = document.getElementById('selExpiry').value;
-  if (expiry) startPolling();
-}
-
-
-async function fetchOnce() {
-  const underlying = document.getElementById('selUnderlying').value;
-  const expiry = document.getElementById('selExpiry').value;
-  if (!expiry) { showError('请先选择到期日'); return; }
-
-  showLoading(true);
-  clearError();
-  try {
-    const adjusted = getAdjusted();
-  const r = await fetch(`/api/vol_smile?underlying=${encodeURIComponent(underlying)}&expiry=${encodeURIComponent(expiry)}&adjusted=${adjusted}`);
-    const d = await r.json();
-    if (!d.ok) { showError(d.detail || '请求失败'); return; }
-    updateChart(d);
-    document.getElementById('statusBar').textContent =
-      `数据时间：${d.timestamp}  |  利率：${d.rate_str}  |  Spot：${d.spot != null ? d.spot.toFixed(4) : '-'}  |  F：${d.forward != null ? d.forward.toFixed(4) : '-'}  |  ATM：${d.atm_strike ?? '-'}  |  Call ${d.calls.length} 点  Put ${d.puts.length} 点`;
-  } catch(e) {
-    showError('网络错误：' + e.message);
-  } finally {
-    showLoading(false);
-  }
-}
-
-function startPolling() {
-  if (timerId) return;
-  fetchOnce();
-  const interval = Math.max(1, parseInt(document.getElementById('inpInterval').value) || 5) * 1000;
-  timerId = setInterval(fetchOnce, interval);
-}
-
-function stopPolling() {
-  if (timerId) { clearInterval(timerId); timerId = null; }
-}
-
-function showError(msg) {
-  const el = document.getElementById('errorMsg');
-  el.textContent = msg;
-  el.style.display = 'block';
-}
-function clearError() {
-  document.getElementById('errorMsg').style.display = 'none';
-}
-function showLoading(v) {
-  document.getElementById('loadingMsg').style.display = v ? 'block' : 'none';
-}
-
-document.getElementById('selUnderlying').addEventListener('change', () => {
-  stopPolling();
+selUnderlying.addEventListener('change', () => {
+  _prevTable = {};
+  _allExpiries = [];
   loadExpiries();
 });
 
-document.getElementById('inpInterval').addEventListener('change', () => {
-  // 间隔变更：若正在轮询则用新间隔重启定时器（不立即 fetch）
-  if (timerId) {
-    clearInterval(timerId);
-    const interval = Math.max(1, parseInt(document.getElementById('inpInterval').value) || 5) * 1000;
-    timerId = setInterval(fetchOnce, interval);
-  }
+selExpiry.addEventListener('change', () => {
+  _prevTable = {};
+  // 触发重渲染
+  if (_latestMsg) scheduleRender(_latestMsg);
 });
 
-document.getElementById('selExpiry').addEventListener('change', () => {
-  updateAdjustedSelector();
-  restartPolling();
+selAdjusted.addEventListener('change', () => {
+  _prevTable = {};
+  if (_latestMsg) scheduleRender(_latestMsg);
 });
 
 // 初始化
 initChart();
 loadExpiries();
+connectWS();
 </script>
 </body>
 </html>

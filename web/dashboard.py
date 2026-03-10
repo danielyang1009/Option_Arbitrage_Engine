@@ -4,6 +4,8 @@
 
 from __future__ import annotations
 
+import asyncio
+import json as _json
 from datetime import date, datetime
 from pathlib import Path
 from typing import Any, Dict, Optional
@@ -14,12 +16,12 @@ import psutil
 import scipy.optimize  # noqa: F401 — 预加载 Intel MKL/libifcoremd，避免首次访问 vol_smile 时才触发
 import scipy.interpolate  # noqa: F401
 import scipy.stats  # noqa: F401
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel, Field
 
 from config.settings import DEFAULT_MARKET_DATA_DIR
-from web.market_cache import get_snapshot, start as start_market_cache, stop as stop_market_cache
+from web.market_cache import get_snapshot, get_rich_snapshot, start as start_market_cache, stop as stop_market_cache
 from web.data_stats import (
     chunks_readable,
     count_today_chunks,
@@ -49,15 +51,58 @@ VOL_SMILE_TEMPLATE_PATH = Path(__file__).resolve().parent / "templates" / "vol_s
 
 app = FastAPI(title="DeltaZero Web Console", version="0.3.0")
 
+_ws_clients: set = set()
+_update_queue: Optional[asyncio.Queue] = None
+
 
 @app.on_event("startup")
 async def _startup() -> None:
-    start_market_cache()
+    global _update_queue
+    _update_queue = asyncio.Queue(maxsize=2)   # maxsize=2 防堆积，旧数据自动丢弃
+    loop = asyncio.get_running_loop()
+    start_market_cache(event_loop=loop, update_queue=_update_queue)
+    asyncio.create_task(_ws_broadcaster())
 
 
 @app.on_event("shutdown")
 async def _shutdown() -> None:
     stop_market_cache()
+
+
+async def _ws_broadcaster() -> None:
+    """从 asyncio.Queue 接收计算结果，广播给所有 WS 客户端。"""
+    while True:
+        try:
+            data = await asyncio.wait_for(_update_queue.get(), timeout=1.0)
+        except asyncio.TimeoutError:
+            continue
+        if not _ws_clients:
+            continue
+        msg = _json.dumps({"ok": True, "ts": int(time.time() * 1000), "data": data})
+        dead: set = set()
+        for ws in list(_ws_clients):
+            try:
+                await ws.send_text(msg)
+            except Exception:
+                dead.add(ws)
+        _ws_clients.difference_update(dead)
+
+
+@app.websocket("/ws/vol_smile")
+async def ws_vol_smile(ws: WebSocket) -> None:
+    await ws.accept()
+    _ws_clients.add(ws)
+    # 新连接立即发送最新快照（不等下次计算）
+    snap = get_rich_snapshot()
+    if snap:
+        await ws.send_text(_json.dumps({"ok": True, "ts": int(time.time() * 1000), "data": snap}))
+    try:
+        while True:
+            await ws.receive_text()   # keep-alive；客户端可发 ping
+    except (WebSocketDisconnect, Exception):
+        pass
+    finally:
+        _ws_clients.discard(ws)
 _dde_lock = threading.Lock()
 _dde_feeder = None
 _dde_routes_cache: Dict[str, Any] = {"key": "", "routes": {}}
