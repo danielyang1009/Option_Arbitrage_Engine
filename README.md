@@ -29,7 +29,7 @@ python console.py
 2. 确认 `metadata/wxy_options.xlsx` 已就位（含 3 个 Sheet：`50etf` / `300etf` / `500etf`）——DDE topic 地址从此文件解析
 3. 在控制台启动 DDEBus（`--source dde`）
 
-> `data_bus/dde_direct_client.py` 用 pywin32 直连通达信（无需 Excel 运行），topic 地址从 `wxy_*.xlsx` 读取，未找到时回退 `{交易所}{代码}` 推算。
+> `data_bus/dde_direct_client.py` 用 ctypes DDEML 直连通达信（无需 Excel 运行），service/topic 地址**仅**来自 `wxy_*.xlsx`，无对应 topic 的合约直接跳过。
 
 ### DDE 监控页面（`/dde`）
 
@@ -69,7 +69,7 @@ python -m monitors.monitor --zmq-port 5555
 - `data_engine.tick_data_loader`
 - `data_engine.bar_data_loader`
 - `data_engine.dde_adapter`
-- `data_bus.dde_direct_client`：纯 Python DDE 直连通达信（pywin32，Excel 无需运行，topic 仍来自 `wxy_*.xlsx`）
+- `data_bus.dde_direct_client`：纯 Python DDE 直连通达信（ctypes DDEML，Excel 无需运行，topic 来自 `wxy_*.xlsx`）
 - `calculators.vectorized_pricer`：向量化 Black-76 IV 求解器（NumPy NR）
 - `backtest.etf_price_simulator`
 
@@ -157,8 +157,62 @@ Monitor 每行除净利润外，还展示以下辅助指标，用于判断能否
 
 不使用仓库根目录存储运行数据。
 
+## DDE 技术说明
+
+### 什么是 DDEML ADVISE 模式
+
+**DDE（Dynamic Data Exchange）** 是 Windows 1987 年引入的 IPC 机制，至今仍被国内行情软件（通达信/QD 等）用于对外暴露实时行情。
+
+Windows 提供两套 DDE API：
+- **原始 DDE（WM_DDE_\*）**：直接收发 Windows 消息，极难用
+- **DDEML**（DDE Management Library）：`user32.dll` 里的高层封装，本项目使用此套
+
+本项目用 Python `ctypes` 直调 `user32.dll` 中的 DDEML 函数，等价于 C 代码调 Win32 API。
+
+**ADVISE 模式（热链接）**：客户端注册订阅后，服务端有更新时**主动推送**，无需轮询。区别于 REQUEST（冷链接，问一次答一次）。
+
+### 完整数据流
+
+```
+行情软件（QD）
+   │  Windows 消息总线
+   ▼
+_DDEClient._dde_callback()      ← DDEML 在消息泵线程触发
+   │  解析 XlTable 二进制流（type=0x0001 FLOAT 记录）
+   ▼
+_tick_buf                        ← 攒齐 5 个字段后触发回调
+   ▼
+DDEDirectSubscriber._on_tick() → tick_queue → DataBus ZMQ PUB
+```
+
+### 关键实现细节
+
+| 步骤 | API | 说明 |
+|------|-----|------|
+| 初始化 | `DdeInitializeW` | 注册为纯客户端，传入回调函数指针 |
+| 建连 | `DdeConnect` | service=`"QD"`，topic=xlsx 里的不透明数字（如 `"2206355670"`） |
+| 订阅 | `DdeClientTransaction(XTYP_ADVSTART)` | 每个字段（LASTPRICE 等）单独注册 |
+| 消息泵 | `PeekMessageW` 循环 | DDEML 回调通过 Windows 消息队列派发，**必须在同一线程内持续运行** |
+
+**XlTable 二进制格式**（ADVISE 回调收到的数据）：
+```
+偏移 0: type=0x0010 (TABLE), size=4  → 容器头，跳过
+偏移 8: type=0x0001 (FLOAT), size=8  → struct.unpack("<d") 读 IEEE 754 双精度浮点
+```
+
+### 为什么不用 pywin32
+
+`pywin32.dde` 的 `ConnectTo()` 对 QD 服务握手方式不兼容，连接必定失败。ctypes DDEML 是唯一可靠路径。
+
+### 为什么 topic 不能推算
+
+topic 是行情软件内部的不透明数字字符串（如 `"2206355670"`），软件升级后可能改变，**只能从 `metadata/wxy_options.xlsx` 的 externalLink XML 中读取**，禁止用代码规则推算。
+
+---
+
 ## 最近变更
 
+- **DDE 死代码清理**：移除 `_code_to_topic()`、`_xls_read_external_links()`、`make_zmq_on_tick()` 等无用代码；默认 service 由 `TdxW` 修正为 `QD`；README 补充 DDEML ADVISE 模式技术说明
 - **DataBus 独立运行**：通过 `CREATE_NEW_CONSOLE` 在独立窗口启动，关闭控制台不影响 DataBus 继续落盘；移除控制台内的日志流面板
 - **Vol Smile 标准/调整合约分离**：`market_cache` 按 `(expiry_date, is_adjusted)` 双键分组，WS 推送新增 `adj_expiries` 字段；前端"调整合约"选项按当前选中到期日动态显隐
 - **进程总览新增 VolSmile 计算条目**：实时显示 LKV 数量与 zmq/compute 线程状态（内置线程，无关闭按钮）

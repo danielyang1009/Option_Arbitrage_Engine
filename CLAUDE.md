@@ -66,34 +66,54 @@ web/dashboard.py         — FastAPI 控制台 + WebSocket /ws/vol_smile 推送
 - `[GUARD-2]` Vega 坍缩保护：`np.maximum(vega, 1e-8)` + `np.clip(step, -0.5, 0.5)`
 - `[GUARD-3]` T 精度：`time.time()` Unix 时间戳，`calc_T()` 返回 `max(T, 1e-6)`
 
-## DDE 链路
+## DDE 链路（核心模块，修改前必读）
 
-DDE（Dynamic Data Exchange）从交易软件（通达信等）实时拉取行情。
+DDE（Dynamic Data Exchange）从本地交易软件实时拉取行情，基于古老的 Windows 消息机制。**修改前必须完整阅读 `data_bus/dde_direct_client.py`**，该文件包含所有 DDE 逻辑。
 
-**两种 DDE 实现**：
-- `data_bus/dde_subscriber.py`：旧版，依赖 `DDERouteParser` 解析 `wxy_*.xlsx`，通过旧 ctypes DDEML
-- `data_bus/dde_direct_client.py`：新版，`TongdaxinDDEClient`（pywin32 ADVISE 模式，无需 Excel 运行），topic 地址仍从 `wxy_*.xlsx` 解析后通过 `topic_map` 参数传入，未提供时 fallback 到 `_code_to_topic()` 推算
+### 实现架构
+
+- `_DDEClient`：底层 ctypes DDEML（`DdeInitializeW` + `XTYP_ADVSTART`，纯 ADVISE 模式）
+- `DDEDirectSubscriber(DataProvider)`：上层接口，供 `bus.py` 调用
+- DDE 所有操作（`DdeInitializeW`、`DdeConnect`、`XTYP_ADVSTART`）在专用 pump 线程中串行执行
 
 ### 文件结构
 
 | 文件 | 说明 |
 |------|------|
-| `metadata/wind_sse_optionchain.xlsx` | Wind 导出的全 SSE 期权合约信息（原名 wind_50etf_optionchain，已改） |
-| `metadata/wxy_50etf.xlsx` | 交易软件导出的 50ETF 期权 DDE 数据表 |
-| `metadata/wxy_300etf.xlsx` | 交易软件导出的 300ETF 期权 DDE 数据表 |
-| `metadata/wxy_500etf.xlsx` | 交易软件导出的 500ETF 期权 DDE 数据表（暂未配置时显示"未找到"） |
+| `metadata/wind_sse_optionchain.xlsx` | Wind 导出的全 SSE 期权合约信息 |
+| `metadata/wxy_options.xlsx` | 交易软件导出的 DDE 数据表（**DDE 寻址的唯一来源**） |
 
-### DDESubscriber 关键参数
+### wxy_options.xlsx 是 DDE 寻址的唯一来源
 
-- `staleness_timeout = 90.0`（秒）：期权合约超过 90s 无变化标记 STALE。ADVISE 模式下 DDE 服务端仅在值变化时推送，深度 OTM 合约可能数分钟无更新，30s 阈值过紧。
-- glob 路径：`metadata/wind_sse_optionchain.xlsx`（精确匹配，不用通配符）
+xlsx 是 ZIP，解析 `xl/externalLinks/externalLink*.xml` 获得全部地址信息：
+- **service**：`ddeService` 属性，实际值为 `"QD"`（不是 `"TdxW"`，用错则全部 `DdeConnect` 失败）
+- **topic**：`ddeTopic` 属性，每个合约对应一个不透明数字字符串（如 `"2206355670"`），不可推算
+- **item 名称**：英文字段 `LASTPRICE`、`BIDPRICE1`、`ASKPRICE1`、`BIDVOLUME1`、`ASKVOLUME1`
+
+`_load_topic_map()` 在 DataBus 启动时读取一次，返回 `(code→topic dict, service_name)`。**禁止用 `_code_to_topic()` 推算 topic**（推算结果对 QD 服务无效）。
+
+### XlTable 二进制响应解析
+
+DDE ADVISE 回调中 `DdeGetData` 返回 XlTable 二进制流（不是字符串）。格式为连续的 `(type:u16, size:u16, data[size])` 记录：
+
+```
+偏移 0: type=0x0010 (TABLE), size=4  → 容器头，跳过其 4 字节数据体
+偏移 8: type=0x0001 (FLOAT),  size=8 → IEEE 754 double，即报价
+```
+
+正确解析：从 `off=0` 开始流式处理，`off += rsize` 跳过记录体，遇到 `type==0x0001 and size==8` 时用 `struct.unpack_from("<d", raw, off)` 读取浮点值。**若从 `off=4` 开始则跳过了 FLOAT 记录，永远取不到数据。**
+
+### 禁止事项
+
+- **禁止用 `pywin32 dde` 模块替换**：`ConnectTo()` 对 QD 服务连接必定失败，只有 ctypes DDEML 可用
+- **禁止将 DDE 操作改为异步或多线程并发**：`DdeConnect` 依赖 Windows 消息泵，必须在单一线程内串行调用并在每次 connect 后立即 `_pump_messages()`
+- **禁止从代码推算 service/topic**：所有地址信息来自 xlsx，软件升级后地址可能改变
 
 ### DDE 测试流程
 
-1. 确认 wxy_*.xlsx 文件已放入 `metadata/`
-2. 离线解析测试：`python -c "from data_bus.dde_subscriber import DDERouteParser; ..."`
-3. 启动 DataBus：`POST /api/processes/recorder/start {"source":"dde"}`
-4. 查看 `/api/state` 确认 `recorder_running: true` 及快照合约数
+1. 确认 `metadata/wxy_options.xlsx` 已放入 `metadata/`
+2. 启动 DataBus：`python -m data_bus.bus --source dde`
+3. 30 秒后看自检日志：`DDE 自检(30s): 累计=N tick, 期权标的=[...]`
 
 ## 核心数据流
 
