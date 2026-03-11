@@ -260,6 +260,14 @@ $$F = K_{atm} + (C_{mid} - P_{mid}) \cdot e^{rT}$$
 | **[GUARD-2]** Vega 坍缩保护 | Vega 安全地板 `1e-8` + 步长截断 `[-0.5, 0.5]`，防深度虚值发散 |
 | **[GUARD-3]** T 精度 | `time.time()` 毫秒 Unix 时间戳，消除 Windows `datetime.now()` 分辨率损失 |
 
+#### HTTP 兜底路径：Brent 法
+
+`/api/vol_smile` HTTP 端点调用 `calc_iv_black76()`（`calculators/iv_calculator.py`），使用 **Brent 法**（`scipy.optimize.brentq`）求解单合约 IV：
+
+$$\sigma^* = \mathop{\text{RootFind}}_{\sigma \in [10^{-4},\, 5.0]} \bigl( \text{Black76}(F,K,T,r,\sigma) - \text{Price}_{mid} = 0 \bigr)$$
+
+Brent 法（二分 + 割线法混合）要求搜索区间端点异号；若端点同号（深度虚值、价格违反无套利边界），直接返回 `nan`。相比 NR，Brent 在 Vega 极小场景下无发散风险，适合单合约 HTTP 调用场景。
+
 ### IV 数据表格
 
 页面下方表格实时显示各行权价的：
@@ -277,7 +285,7 @@ $$F = K_{atm} + (C_{mid} - P_{mid}) \cdot e^{rT}$$
 
 | 文件 | 说明 |
 |------|------|
-| `calculators/iv_calculator.py` | `calc_implied_forward()` + `black76_price()` + `calc_iv_black76()` |
+| `calculators/iv_calculator.py` | `calc_implied_forward()` + `black76_price()` + `calc_iv_black76()`（Brent 法，HTTP 兜底） |
 | `calculators/vectorized_pricer.py` | `VectorizedIVCalculator`（向量化 NR + Greeks，GUARD-1/2/3） |
 | `web/market_cache.py` | ZMQ SUB 线程 + compute 线程 + `get_rich_snapshot()` |
 | `web/dashboard.py` | `/ws/vol_smile` WS endpoint + `_ws_broadcaster` + `/api/vol_smile` HTTP 端点 |
