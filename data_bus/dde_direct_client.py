@@ -33,6 +33,11 @@ _FIELD_MAP: Dict[str, str] = {
     "askv1": "ASKVOLUME1",
 }
 
+# tick 触发条件：三个价格字段必须全到，且至少一个量字段到达才触发
+# 避免量字段赶不上价格字段所在批次，导致 ask_volume/bid_volume 始终为 0
+_TICK_PRICE_FIELDS = frozenset({"last", "bid1", "ask1"})
+_TICK_VOL_FIELDS   = frozenset({"bidv1", "askv1"})
+
 
 # ── xlsx 路由解析常量 ────────────────────────────────────────────────────────
 _NS_MAIN = {"s": "http://schemas.openxmlformats.org/spreadsheetml/2006/main"}
@@ -665,7 +670,8 @@ class _DDEClient:
                 logger.info("DDE 回调 #%d: code=%s field=%s value=%s", self._cb_total, code, field, value)
             buf = self._tick_buf.setdefault(code, {})
             buf[field] = value
-            if len(buf) >= 3:
+            buf_keys = buf.keys()
+            if _TICK_PRICE_FIELDS.issubset(buf_keys) and (buf_keys & _TICK_VOL_FIELDS):
                 self._on_tick_cb(code, dict(buf), ts_ms)
                 self._tick_total += 1
                 if self._tick_total <= 3:

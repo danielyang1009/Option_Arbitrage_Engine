@@ -260,6 +260,7 @@ xlsx 是 ZIP，`_load_topic_map()` 解析其中的 `xl/externalLinks/externalLin
 - **DDE 死代码清理**：移除 `_code_to_topic()`、`_xls_read_external_links()`、`make_zmq_on_tick()` 等无用代码；默认 service 由 `TdxW` 修正为 `QD`；README 补充 DDEML ADVISE 模式技术说明
 - **DataBus 独立运行**：通过 `CREATE_NEW_CONSOLE` 在独立窗口启动，关闭控制台不影响 DataBus 继续落盘；移除控制台内的日志流面板
 - **Vol Smile 标准/调整合约分离**：`market_cache` 按 `(expiry_date, is_adjusted)` 双键分组，WS 推送新增 `adj_expiries` 字段；前端"调整合约"选项按当前选中到期日动态显隐
+- **DDE tick 触发条件修复**：`_accumulate` 由"任意 3 字段触发"改为"价格三件套 + 至少一个量字段全到才触发"，修复 ETF 量字段（bidv1/askv1）赶不上价格字段导致 `max_qty` / `OBI_s` 始终显示 `--` 的问题
 - **DDE 连接重试**：全部合约连接失败时按 `retry_interval`（默认 10s）自动重试，心跳日志升级为 INFO 并附带回调/tick 累计计数；新增未知合约一次性警告，避免重复刷屏
 - **合约目录过滤 Office 临时文件**：`get_optionchain_path()` 跳过 `~$` 开头的锁文件，防止 Excel 打开时误读临时副本
 - **OBI_S 计算修复**：`pcp_arbitrage._compute_forward_metrics()` 修正 ETF 订单流失衡度分母逻辑，消除 `None` 导致的运算错误
