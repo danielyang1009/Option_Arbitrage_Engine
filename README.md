@@ -289,7 +289,7 @@ xlsx 是 ZIP，`_load_topic_map()` 解析其中的 `xl/externalLinks/externalLin
 
 ## 最近变更
 
-- **Web Monitor 显示优化**：净利润/Net_1T 改为整数显示（与终端一致）；新增方向列（正向/空，三档配色）；IV 信息从独立行合并至表头（`MM-DD IV X.X%` 标签）；非净利润列统一黑色字体；净利润负值改为更浅灰色；各品种默认折叠；行高固定 26px 防抖动；正向/≥N元 加粗显示
+- **Web Monitor 显示优化**：净利润/Net_1T 改为整数显示（与终端一致）；新增方向列（正向/空，三档配色）；IV 标签移至表头正向/≥N元之后，配对/有报价保留右对齐；品种名加粗；各品种默认折叠；行高固定 26px 防抖动
 - **交易日计算后移后端**：`utils/time_utils` 新增 `trading_days_until()`（akshare 日历，回退工作日），`market_cache` 序列化时附加 `expiry_info`（自然日/交易日），前端不再自行计算；终端 monitor 私有函数提升为共用工具
 - **DDE 状态机重构**：`_DDEClient` 由逐字段攒 buf 触发改为永久状态机 + `_flush_dirty` 泵送后统一发送，支持无成交远月合约（只需有盘口），消除微观状态撕裂；BLANK/ERROR 回调写入哨兵值（askv1=0/ask1=999999 等）而非 NaN
 - **Web Monitor 页面（`/monitor`）**：新增网页版 PCP 套利监控，`market-cache-monitor` 线程独立 ZMQ SUB（无 CONFLATE）+ 事件驱动，收到 tick 立即触发计算，aligner 增量更新（不再每轮 reset），数据延迟与终端 monitor 对齐；对应 WebSocket 端点 `/ws/monitor`
