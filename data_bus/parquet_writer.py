@@ -299,7 +299,7 @@ class ParquetWriter:
                         df["_m"] = df["_dt"].dt.minute
                         df["_date_ok"] = df["_dt"].dt.date == target_date
                         mask = df["_date_ok"] & (
-                            ((df["_h"] == 9) & (df["_m"] >= 30))
+                            ((df["_h"] == 9) & (df["_m"] >= 15))
                             | ((df["_h"] == 10))
                             | ((df["_h"] == 11) & (df["_m"] <= 30))
                             | ((df["_h"] == 13))

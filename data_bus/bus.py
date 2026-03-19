@@ -55,7 +55,7 @@ logger = logging.getLogger("databus")
 
 def _in_trading_hours(now: datetime) -> bool:
     t = now.time()
-    return ((t.hour == 9 and t.minute >= 30) or (10 <= t.hour < 11) or (t.hour == 11 and t.minute <= 30)
+    return ((t.hour == 9 and t.minute >= 15) or (10 <= t.hour < 11) or (t.hour == 11 and t.minute <= 30)
             or (13 <= t.hour < 15))
 
 
