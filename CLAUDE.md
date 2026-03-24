@@ -25,6 +25,10 @@ python -m data_engine.bond_termstructure_fetcher --kind cgb
 
 # 回测
 python -m backtest.run
+
+# Parquet 数据质量检查（ETF + 期权，三品种）
+python scripts/analyze_parquet.py               # 默认今日
+python scripts/analyze_parquet.py 20260324      # 指定日期
 ```
 
 ## 架构：四层流水线

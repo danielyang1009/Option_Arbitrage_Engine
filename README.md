@@ -176,6 +176,7 @@ Monitor 每行除净利润外，还展示以下辅助指标，用于判断能否
 
 ## 最近变更
 
+- **Parquet 数据质量检查脚本统一**：三旧脚本合并为 `scripts/analyze_parquet.py`，支持三品种（50/300/500ETF）ETF + 期权文件一键检查
 - **集合竞价数据落盘**：DataBus 起始时间由 9:30 提前至 9:15，完整保留集合竞价 tick
 - **信号多态架构重构**：`BaseSignal` / `SignalAction` 引入，`generate_signals` 统一入口，Engine 按 `action` 自动分派 OPEN/CLOSE
 - **PnL 防腐层 + multiplier Bug 修正**：`analysis/pnl.py` 引入多态分派，修正期权腿漏乘 `multiplier` 历史 Bug
